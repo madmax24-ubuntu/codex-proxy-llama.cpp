@@ -2,7 +2,7 @@
 "use strict";
 
 /*
-  Codex <-> llama.cpp Responses compatibility proxy 1.0.1
+  Codex <-> llama.cpp Responses compatibility proxy 1.0.2
 
   Adds support for:
     - Codex namespace tools (MCP) -> flattened function tools for llama.cpp
@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.1";
+const VERSION = "1.0.2";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -183,6 +183,11 @@ function applyCompactionPolicy(body, limit = COMPACT_MAX_OUTPUT_TOKENS) {
   }
   body.tool_choice = "none";
   body.parallel_tool_calls = false;
+  const contract = "COMPACTION OUTPUT CONTRACT: Return only a Russian checkpoint. The first line must be CONTEXT CHECKPOINT SUMMARY. Include these headings in order: CURRENT TASK, WORK COMPLETED, DECISIONS AND CONSTRAINTS, STATE SNAPSHOT, OPEN ISSUES, PARKED TASKS, NEXT ACTION. Never emit tool calls, XML-like tool tags, commands to execute, chain-of-thought, or assistant commentary. End after NEXT ACTION.";
+  const instructions = typeof body.instructions === "string" ? body.instructions.trim() : "";
+  if (!instructions.includes("COMPACTION OUTPUT CONTRACT:")) {
+    body.instructions = instructions ? `${instructions}\n\n${contract}` : contract;
+  }
   return body;
 }
 
@@ -464,6 +469,76 @@ const COMPACT_SUMMARY_PREFIXES = [
   "Previous LLM was interrupted and summarized the work so far.",
   "CONTEXT CHECKPOINT SUMMARY"
 ];
+
+const COMPACTION_REQUIRED_HEADINGS = [
+  "CURRENT TASK",
+  "WORK COMPLETED",
+  "DECISIONS AND CONSTRAINTS",
+  "STATE SNAPSHOT",
+  "OPEN ISSUES",
+  "PARKED TASKS",
+  "NEXT ACTION"
+];
+
+function isCompactionInstructionText(text) {
+  return /CONTEXT CHECKPOINT (?:SUMMARY|COMPACTION)|Create a handoff summary for another LLM|continuation handoff for the next model/i.test(text || "");
+}
+
+function isValidCompactionText(text) {
+  if (typeof text !== "string") return false;
+  const clean = text.trim();
+  if (!clean.startsWith("CONTEXT CHECKPOINT SUMMARY")) return false;
+  if (/<\/?tool_call\b|<function=|<parameter=|<\|(?:tool_call|im_start|im_end)\|>|assistant\s+to=/i.test(clean)) return false;
+  let offset = 0;
+  for (const heading of COMPACTION_REQUIRED_HEADINGS) {
+    const index = clean.indexOf(heading, offset);
+    if (index < offset) return false;
+    offset = index + heading.length;
+  }
+  return true;
+}
+
+function cleanRecoveryText(text, limit = 4000) {
+  return String(text || "")
+    .replace(/<[^>]{0,300}>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, limit);
+}
+
+function buildCompactionRecoverySummary(body) {
+  const users = Array.isArray(body?.input)
+    ? body.input.filter(isUserMessageItem).map(item => messageContentText(item.content).trim()).filter(Boolean)
+    : [];
+  const latest = [...users].reverse().find(text => !isCompactionInstructionText(text) && !COMPACT_SUMMARY_PREFIXES.some(prefix => text.startsWith(prefix)));
+  const task = cleanRecoveryText(latest) || "Продолжить последний активный запрос пользователя, сверившись с рабочей директорией и сохранённым transcript.";
+  return [
+    "CONTEXT CHECKPOINT SUMMARY",
+    "",
+    "CURRENT TASK",
+    `- ${task}`,
+    "",
+    "WORK COMPLETED",
+    "- Автоматическое сжатие было перехвачено прокси: ответ модели имел недопустимый формат и не был показан как вызов инструмента.",
+    "",
+    "DECISIONS AND CONSTRAINTS",
+    "- Отвечать пользователю на русском языке.",
+    "- Не выводить внутренние рассуждения и не имитировать вызовы инструментов текстом.",
+    "- Сохранить пользовательские изменения и проверить состояние файлов перед продолжением.",
+    "",
+    "STATE SNAPSHOT",
+    "- Полный transcript до сжатия сохранён прокси как cold memory и доступен при необходимости точного восстановления деталей.",
+    "",
+    "OPEN ISSUES",
+    "- Точный последний завершённый шаг нужно определить по рабочей директории и cold memory.",
+    "",
+    "PARKED TASKS",
+    "- Нет задач, которые следует считать отменёнными.",
+    "",
+    "NEXT ACTION",
+    "- Молча восстановить состояние последней задачи, затем продолжить её с ближайшего незавершённого шага."
+  ].join("\n");
+}
 
 function approxTextTokens(text) {
   if (typeof text !== "string" || !text) return 0;
@@ -863,6 +938,21 @@ class SseTranslator {
     this.bufferedMessageEvents = [];
   }
 
+  recoveredCompactionEvents(evt, text) {
+    const itemId = `msg_compaction_recovery_${String(evt.response?.id || Date.now()).replace(/[^a-zA-Z0-9_-]/g, "_")}`;
+    const item = { id: itemId, type: "message", role: "assistant", content: [{ type: "output_text", text, annotations: [] }] };
+    evt.response.output = [item];
+    return [
+      this.event({ type: "response.output_item.added", output_index: 0, item: { ...item, content: [] } }),
+      this.event({ type: "response.content_part.added", item_id: itemId, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } }),
+      this.event({ type: "response.output_text.delta", item_id: itemId, output_index: 0, content_index: 0, delta: text }),
+      this.event({ type: "response.output_text.done", item_id: itemId, output_index: 0, content_index: 0, text }),
+      this.event({ type: "response.content_part.done", item_id: itemId, output_index: 0, content_index: 0, part: item.content[0] }),
+      this.event({ type: "response.output_item.done", output_index: 0, item }),
+      this.event(evt)
+    ];
+  }
+
   // IMPORTANT: this returns a COMPLETE SSE event. A blank line terminates an
   // event per the SSE standard. v16.0-v16.2 returned only one '\n', so multiple
   // synthetic data lines could be concatenated into one invalid JSON event.
@@ -1043,6 +1133,15 @@ class SseTranslator {
 
     if (evt.type === "response.completed") {
       normalizeCompletedForCodex(evt);
+      if (this.requestMeta.isCompaction && !isValidCompactionText(this.text)) {
+        const recovery = this.requestMeta.recoverySummary || buildCompactionRecoverySummary(null);
+        this.bufferedMessageEvents = [];
+        this.sawCompletedForwarded = true;
+        const usage = usageFrom(evt);
+        diag(`COMPACTION_GUARD replaced_invalid_output chars=${this.text.length}; ${usageLine(usage)}`);
+        if (this.requestMeta.checkpointPath) updateCheckpointSummary(this.requestMeta.checkpointPath, recovery, usage);
+        return this.recoveredCompactionEvents(evt, recovery);
+      }
       const suppressed = this.sawToolCall ? suppressMessagesWithToolCalls(evt.response) : 0;
       const buffered = this.sawToolCall ? [] : this.bufferedMessageEvents;
       if (this.sawToolCall && this.bufferedMessageEvents.length) {
@@ -1112,6 +1211,7 @@ function createServer() {
           requestMeta.fingerprint = requestFingerprint(parsed);
           if (requestMeta.isCompaction) {
             requestMeta.checkpointPath = saveCheckpoint("compaction", { request: parsed });
+            requestMeta.recoverySummary = buildCompactionRecoverySummary(parsed);
             if (requestMeta.checkpointPath) {
               CHECKPOINT_BY_KEY.set(requestMeta.cacheKey, requestMeta.checkpointPath);
               CHECKPOINT_BY_KEY.set(`model:${parsed.model || DEFAULT_MODEL}`, requestMeta.checkpointPath);
@@ -1739,6 +1839,46 @@ function selftest() {
       finalMessageCompleted[1]?.type !== "response.output_text.delta" ||
       finalMessageCompleted[2]?.type !== "response.completed") {
     throw new Error("final assistant message buffering failed");
+  }
+
+  const validCheckpoint = [
+    "CONTEXT CHECKPOINT SUMMARY",
+    "CURRENT TASK",
+    "WORK COMPLETED",
+    "DECISIONS AND CONSTRAINTS",
+    "STATE SNAPSHOT",
+    "OPEN ISSUES",
+    "PARKED TASKS",
+    "NEXT ACTION"
+  ].join("\n");
+  if (!isValidCompactionText(validCheckpoint) || isValidCompactionText(`${validCheckpoint}\n<tool_call>`)) {
+    throw new Error("compaction output validation failed");
+  }
+  const recoverySummary = buildCompactionRecoverySummary({
+    input: [{ role: "user", content: [{ type: "input_text", text: "Продолжить проверку проекта" }] }]
+  });
+  const invalidCompaction = new SseTranslator(p.maps, { isCompaction: true, recoverySummary });
+  invalidCompaction.translate("data: " + JSON.stringify({
+    type: "response.output_item.added",
+    output_index: 0,
+    item: { id: "msg_bad_compaction", type: "message", role: "assistant", content: [] }
+  }));
+  invalidCompaction.translate("data: " + JSON.stringify({
+    type: "response.output_text.delta",
+    item_id: "msg_bad_compaction",
+    output_index: 0,
+    content_index: 0,
+    delta: "<tool_call><function=shell_command>"
+  }));
+  const recoveredCompaction = parseSseJsonEvents(invalidCompaction.translate("data: " + JSON.stringify({
+    type: "response.completed",
+    response: { id: "resp_bad_compaction", status: "completed", output: [] }
+  })));
+  if (recoveredCompaction.length !== 7 ||
+      recoveredCompaction.some(event => JSON.stringify(event).includes("<tool_call>")) ||
+      recoveredCompaction[2]?.delta !== recoverySummary ||
+      recoveredCompaction[6]?.response?.output?.[0]?.content?.[0]?.text !== recoverySummary) {
+    throw new Error("invalid compaction recovery failed");
   }
 
   const compactProbe = {
