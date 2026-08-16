@@ -589,12 +589,12 @@ function normalizeInstructionMessages(body) {
   return { moved, roles };
 }
 
-function rewriteHistoryNode(node, maps) {
+function rewriteHistoryNode(node, maps, repairs = []) {
   if (Array.isArray(node)) {
-    for (const x of node) rewriteHistoryNode(x, maps);
-    return;
+    for (const x of node) rewriteHistoryNode(x, maps, repairs);
+    return repairs;
   }
-  if (!node || typeof node !== "object") return;
+  if (!node || typeof node !== "object") return repairs;
 
   // Codex namespaced function call -> flat llama.cpp function call.
   if (node.type === "function_call" &&
@@ -613,6 +613,19 @@ function rewriteHistoryNode(node, maps) {
     delete node.namespace;
   }
 
+  if (node.type === "function_call") {
+    if (node.arguments && typeof node.arguments === "object") {
+      node.arguments = JSON.stringify(node.arguments);
+    } else {
+      try {
+        JSON.parse(node.arguments);
+      } catch {
+        repairs.push({ name: typeof node.name === "string" ? node.name : "unknown" });
+        node.arguments = "{}";
+      }
+    }
+  }
+
   // Codex custom-tool result -> llama.cpp function result.
   if (node.type === "custom_tool_call_output") {
     node.type = "function_call_output";
@@ -620,7 +633,8 @@ function rewriteHistoryNode(node, maps) {
 
   normalizeToolOutputArray(node);
 
-  for (const v of Object.values(node)) rewriteHistoryNode(v, maps);
+  for (const v of Object.values(node)) rewriteHistoryNode(v, maps, repairs);
+  return repairs;
 }
 
 function reasoningBudgetForEffort(effort) {
@@ -676,7 +690,7 @@ function prepareRequest(original) {
   const instructionNormalization = normalizeInstructionMessages(body);
   const postCompactPruning = prunePostCompactionUserHistory(body);
   rewriteTools(body, maps);
-  rewriteHistoryNode(body.input, maps);
+  const historyRepairs = rewriteHistoryNode(body.input, maps);
 
   if (Array.isArray(body.include)) {
     body.include = body.include.filter(x =>
@@ -684,7 +698,7 @@ function prepareRequest(original) {
     );
   }
 
-  return { body, maps, instructionNormalization, reasoningNormalization, postCompactPruning };
+  return { body, maps, instructionNormalization, reasoningNormalization, postCompactPruning, historyRepairs };
 }
 
 function namespaceInfo(name, maps) {
@@ -1106,6 +1120,11 @@ function createServer() {
 
           const prepared = prepareRequest(parsed);
           maps = prepared.maps;
+
+          if (prepared.historyRepairs.length) {
+            const names = [...new Set(prepared.historyRepairs.map(x => x.name))];
+            diag(`HISTORY repaired malformed function_call arguments count=${prepared.historyRepairs.length} names=${JSON.stringify(names)}`);
+          }
 
           if (requestMeta.isCompaction) {
             applyCompactionPolicy(prepared.body);
@@ -1723,7 +1742,10 @@ function selftest() {
   }
 
   const compactProbe = {
-    input: [{ role: "user", content: [{ type: "input_text", text: "You are performing a CONTEXT CHECKPOINT COMPACTION." }] }]
+    input: [
+      { type: "function_call", call_id: "broken_call", name: "fetch_url", arguments: '{"url":"https://ghcr.io/v2/' },
+      { role: "user", content: [{ type: "input_text", text: "You are performing a CONTEXT CHECKPOINT COMPACTION." }] }
+    ]
   };
   if (!isCompactionRequest(compactProbe)) {
     throw new Error("compaction request detection failed");
@@ -1732,6 +1754,9 @@ function selftest() {
   applyCompactionPolicy(compactCapped.body, 4096);
   if (compactCapped.body.max_output_tokens !== 4096) {
     throw new Error("compaction max_output_tokens cap failed");
+  }
+  if (compactCapped.historyRepairs.length !== 1 || compactCapped.body.input[0].arguments !== "{}") {
+    throw new Error("malformed historical function call repair failed");
   }
 
   const mixedInstructions = prepareRequest({
