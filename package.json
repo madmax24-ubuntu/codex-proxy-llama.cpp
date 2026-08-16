@@ -1,0 +1,14 @@
+{
+  "name": "codex-proxy-llama-cpp",
+  "version": "1.0.1",
+  "private": true,
+  "description": "Codex Responses compatibility proxy for llama.cpp",
+  "license": "MIT",
+  "scripts": {
+    "start": "node proxy.js",
+    "test": "node proxy.js --selftest"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
