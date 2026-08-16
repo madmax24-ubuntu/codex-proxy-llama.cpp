@@ -2,7 +2,7 @@
 "use strict";
 
 /*
-  Codex <-> llama.cpp Responses compatibility proxy 1.0.2
+  Codex <-> llama.cpp Responses compatibility proxy 1.0.3
 
   Adds support for:
     - Codex namespace tools (MCP) -> flattened function tools for llama.cpp
@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.2";
+const VERSION = "1.0.3";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -154,16 +154,14 @@ function appendCheckpointHint(body, checkpointPath) {
 }
 
 function isCompactionRequest(body) {
-  if (!body || typeof body !== "object") return false;
-  try {
-    const text = JSON.stringify(body.input ?? "");
-    return text.includes("CONTEXT CHECKPOINT SUMMARY") ||
-      text.includes("CONTEXT CHECKPOINT COMPACTION") ||
-      text.includes("Create a handoff summary for another LLM") ||
-      text.includes("continuation handoff for the next model");
-  } catch {
-    return false;
-  }
+  if (!body || typeof body !== "object" || !Array.isArray(body.input)) return false;
+  const latestUser = [...body.input].reverse().find(isUserMessageItem);
+  if (!latestUser) return false;
+  const text = messageContentText(latestUser.content).trimStart();
+  return text.startsWith("Interrupted. You are creating a CONTEXT CHECKPOINT SUMMARY") ||
+    text.startsWith("You are performing a CONTEXT CHECKPOINT COMPACTION") ||
+    text.startsWith("Create a handoff summary for another LLM") ||
+    text.startsWith("Create a continuation handoff for the next model");
 }
 
 
@@ -1889,6 +1887,12 @@ function selftest() {
   };
   if (!isCompactionRequest(compactProbe)) {
     throw new Error("compaction request detection failed");
+  }
+  if (isCompactionRequest({ input: [
+    { role: "user", content: [{ type: "input_text", text: "Another language model started to solve this problem. CONTEXT CHECKPOINT SUMMARY" }] },
+    { role: "user", content: [{ type: "input_text", text: "Продолжай обычную работу" }] }
+  ] })) {
+    throw new Error("historical summary was misclassified as a compaction request");
   }
   const compactCapped = prepareRequest(compactProbe);
   applyCompactionPolicy(compactCapped.body, 4096);
