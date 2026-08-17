@@ -2,7 +2,7 @@
 "use strict";
 
 /*
-  Codex <-> llama.cpp Responses compatibility proxy 1.0.5
+  Codex <-> llama.cpp Responses compatibility proxy 1.0.6
 
   Adds support for:
     - Codex namespace tools (MCP) -> flattened function tools for llama.cpp
@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.5";
+const VERSION = "1.0.6";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -40,7 +40,7 @@ const DEFAULT_MODEL = process.env.CODEX_MODEL || "llm";
 const DEBUG = /^(1|true|yes)$/i.test(process.env.CODEX_PROXY_DEBUG || "");
 const DIAG_PATH = process.env.CODEX_PROXY_DIAG || path.join(__dirname, "proxy.log");
 const POST_COMPACT_OLD_USER_TOKEN_LIMIT = Math.max(0, Number(process.env.CODEX_POST_COMPACT_OLD_USER_TOKEN_LIMIT || "4096") || 0);
-const COMPACT_MAX_OUTPUT_TOKENS = Math.max(1024, Number(process.env.CODEX_COMPACT_MAX_OUTPUT_TOKENS || "2048") || 2048);
+const COMPACT_MAX_OUTPUT_TOKENS = Math.max(1024, Number(process.env.CODEX_COMPACT_MAX_OUTPUT_TOKENS || "3072") || 3072);
 const COMPACT_REASONING_EFFORT = String(process.env.CODEX_COMPACT_REASONING_EFFORT || "low").toLowerCase();
 const COMPACT_REASONING_BUDGET = Math.max(0, Number(process.env.CODEX_COMPACT_REASONING_BUDGET || "0") || 0);
 const REASONING_BUDGET_LOW = Math.max(0, Number(process.env.CODEX_REASONING_BUDGET_LOW || "0") || 0);

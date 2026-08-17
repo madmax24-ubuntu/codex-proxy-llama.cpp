@@ -188,7 +188,7 @@ The installer creates:
 | `CODEX_THINKING_MODE` | `auto`, `qwen`, `generic`, `on`, or `off` | `auto` |
 | `CODEX_REASONING_LEVELS` | Comma-separated supported levels | `low,medium,high` |
 | `CODEX_FORCE_SERIAL_TOOL_CALLS` | Force serial tool calls | `1` |
-| `CODEX_COMPACT_MAX_OUTPUT_TOKENS` | Compaction output cap | `2048` |
+| `CODEX_COMPACT_MAX_OUTPUT_TOKENS` | Compaction output cap | `3072` |
 | `CODEX_CHECKPOINT_DIR` | Cold-checkpoint directory | `./checkpoints` |
 | `CODEX_PROXY_DIAG` | Diagnostic log path | `./proxy.log` |
 
