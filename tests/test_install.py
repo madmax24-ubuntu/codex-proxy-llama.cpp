@@ -42,7 +42,10 @@ class InstallerTests(unittest.TestCase):
             files = install.write_install(settings, False, False)
             self.assertEqual(len(files), 8)
             self.assertTrue((root / "proxy.js").exists())
-            self.assertIn("model_provider", (root / "config.toml").read_text(encoding="utf-8"))
+            config = (root / "config.toml").read_text(encoding="utf-8")
+            self.assertIn("model_provider", config)
+            self.assertIn("Interrupted. You are creating a CONTEXT CHECKPOINT SUMMARY", config)
+            self.assertIn("## NEXT ACTION", config)
             install.write_install(settings, True, False)
             self.assertTrue(list(root.glob("config.toml.backup-*")))
 

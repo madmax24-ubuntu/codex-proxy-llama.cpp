@@ -2,7 +2,7 @@
 "use strict";
 
 /*
-  Codex <-> llama.cpp Responses compatibility proxy 1.0.3
+  Codex <-> llama.cpp Responses compatibility proxy 1.0.4
 
   Adds support for:
     - Codex namespace tools (MCP) -> flattened function tools for llama.cpp
@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.3";
+const VERSION = "1.0.4";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -39,7 +39,7 @@ const UPSTREAM_API_KEY = process.env.LLAMA_API_KEY || "";
 const DEFAULT_MODEL = process.env.CODEX_MODEL || "llm";
 const DEBUG = /^(1|true|yes)$/i.test(process.env.CODEX_PROXY_DEBUG || "");
 const DIAG_PATH = process.env.CODEX_PROXY_DIAG || path.join(__dirname, "proxy.log");
-const POST_COMPACT_OLD_USER_TOKEN_LIMIT = Math.max(0, Number(process.env.CODEX_POST_COMPACT_OLD_USER_TOKEN_LIMIT || "0") || 0);
+const POST_COMPACT_OLD_USER_TOKEN_LIMIT = Math.max(0, Number(process.env.CODEX_POST_COMPACT_OLD_USER_TOKEN_LIMIT || "4096") || 0);
 const COMPACT_MAX_OUTPUT_TOKENS = Math.max(1024, Number(process.env.CODEX_COMPACT_MAX_OUTPUT_TOKENS || "2048") || 2048);
 const COMPACT_REASONING_EFFORT = String(process.env.CODEX_COMPACT_REASONING_EFFORT || "low").toLowerCase();
 const COMPACT_REASONING_BUDGET = Math.max(0, Number(process.env.CODEX_COMPACT_REASONING_BUDGET || "0") || 0);
@@ -181,7 +181,7 @@ function applyCompactionPolicy(body, limit = COMPACT_MAX_OUTPUT_TOKENS) {
   }
   body.tool_choice = "none";
   body.parallel_tool_calls = false;
-  const contract = "COMPACTION OUTPUT CONTRACT: Return only a Russian checkpoint. The first line must be CONTEXT CHECKPOINT SUMMARY. Include these headings in order: CURRENT TASK, WORK COMPLETED, DECISIONS AND CONSTRAINTS, STATE SNAPSHOT, OPEN ISSUES, PARKED TASKS, NEXT ACTION. Never emit tool calls, XML-like tool tags, commands to execute, chain-of-thought, or assistant commentary. End after NEXT ACTION.";
+  const contract = "COMPACTION OUTPUT CONTRACT: Return only a dense checkpoint in the configured user language. The first line must be # CONTEXT CHECKPOINT SUMMARY. Use Markdown headings in this order: CURRENT TASK, WORK COMPLETED, DECISIONS AND CONSTRAINTS, STATE SNAPSHOT, OPEN ISSUES, PARKED TASKS, NEXT ACTION. Preserve concrete state from previous checkpoints. Never emit tool calls, XML-like tool tags, chain-of-thought, or assistant commentary. Target 1200-1600 tokens and finish all sections before the output limit.";
   const instructions = typeof body.instructions === "string" ? body.instructions.trim() : "";
   if (!instructions.includes("COMPACTION OUTPUT CONTRACT:")) {
     body.instructions = instructions ? `${instructions}\n\n${contract}` : contract;
@@ -465,6 +465,7 @@ function messageContentText(content) {
 const COMPACT_SUMMARY_PREFIXES = [
   "Another language model started to solve this problem and produced a summary of its thinking process.",
   "Previous LLM was interrupted and summarized the work so far.",
+  "# CONTEXT CHECKPOINT SUMMARY",
   "CONTEXT CHECKPOINT SUMMARY"
 ];
 
@@ -482,18 +483,30 @@ function isCompactionInstructionText(text) {
   return /CONTEXT CHECKPOINT (?:SUMMARY|COMPACTION)|Create a handoff summary for another LLM|continuation handoff for the next model/i.test(text || "");
 }
 
-function isValidCompactionText(text) {
-  if (typeof text !== "string") return false;
-  const clean = text.trim();
-  if (!clean.startsWith("CONTEXT CHECKPOINT SUMMARY")) return false;
-  if (/<\/?tool_call\b|<function=|<parameter=|<\|(?:tool_call|im_start|im_end)\|>|assistant\s+to=/i.test(clean)) return false;
+function compactionTextMetrics(text) {
+  const clean = typeof text === "string" ? text.trim() : "";
+  const canonical = clean.replace(/^#{1,6}\s*/, "");
+  const prefix = canonical.startsWith("CONTEXT CHECKPOINT SUMMARY");
+  const forbidden = /<\/?tool_call\b|<function=|<parameter=|<\|(?:tool_call|im_start|im_end)\|>|assistant\s+to=/i.test(clean);
   let offset = 0;
+  let present = 0;
+  let current = -1;
+  let completed = -1;
   for (const heading of COMPACTION_REQUIRED_HEADINGS) {
     const index = clean.indexOf(heading, offset);
-    if (index < offset) return false;
+    if (index < offset) continue;
+    if (heading === "CURRENT TASK") current = index;
+    if (heading === "WORK COMPLETED") completed = index;
+    present++;
     offset = index + heading.length;
   }
-  return true;
+  return { clean, prefix, forbidden, present, current, completed };
+}
+
+function isValidCompactionText(text) {
+  const metrics = compactionTextMetrics(text);
+  return metrics.prefix && !metrics.forbidden && metrics.current >= 0 && metrics.completed > metrics.current &&
+    (metrics.present >= 4 || metrics.clean.length >= 1600);
 }
 
 function cleanRecoveryText(text, limit = 4000) {
@@ -505,35 +518,43 @@ function cleanRecoveryText(text, limit = 4000) {
 }
 
 function buildCompactionRecoverySummary(body) {
+  const items = Array.isArray(body?.input) ? body.input : [];
+  for (let i = items.length - 1; i >= 0; i--) {
+    const text = messageContentText(items[i]?.content);
+    const match = text.match(/^#{0,6}\s*CONTEXT CHECKPOINT SUMMARY\b/m);
+    if (!match) continue;
+    const prior = text.slice(match.index).trim();
+    if (isValidCompactionText(prior)) return prior;
+  }
   const users = Array.isArray(body?.input)
     ? body.input.filter(isUserMessageItem).map(item => messageContentText(item.content).trim()).filter(Boolean)
     : [];
   const latest = [...users].reverse().find(text => !isCompactionInstructionText(text) && !COMPACT_SUMMARY_PREFIXES.some(prefix => text.startsWith(prefix)));
   const task = cleanRecoveryText(latest) || "Продолжить последний активный запрос пользователя, сверившись с рабочей директорией и сохранённым transcript.";
   return [
-    "CONTEXT CHECKPOINT SUMMARY",
+    "# CONTEXT CHECKPOINT SUMMARY",
     "",
-    "CURRENT TASK",
+    "## CURRENT TASK",
     `- ${task}`,
     "",
-    "WORK COMPLETED",
+    "## WORK COMPLETED",
     "- Автоматическое сжатие было перехвачено прокси: ответ модели имел недопустимый формат и не был показан как вызов инструмента.",
     "",
-    "DECISIONS AND CONSTRAINTS",
+    "## DECISIONS AND CONSTRAINTS",
     "- Отвечать пользователю на русском языке.",
     "- Не выводить внутренние рассуждения и не имитировать вызовы инструментов текстом.",
     "- Сохранить пользовательские изменения и проверить состояние файлов перед продолжением.",
     "",
-    "STATE SNAPSHOT",
+    "## STATE SNAPSHOT",
     "- Полный transcript до сжатия сохранён прокси как cold memory и доступен при необходимости точного восстановления деталей.",
     "",
-    "OPEN ISSUES",
+    "## OPEN ISSUES",
     "- Точный последний завершённый шаг нужно определить по рабочей директории и cold memory.",
     "",
-    "PARKED TASKS",
+    "## PARKED TASKS",
     "- Нет задач, которые следует считать отменёнными.",
     "",
-    "NEXT ACTION",
+    "## NEXT ACTION",
     "- Молча восстановить состояние последней задачи, затем продолжить её с ближайшего незавершённого шага."
   ].join("\n");
 }
@@ -1133,10 +1154,11 @@ class SseTranslator {
       normalizeCompletedForCodex(evt);
       if (this.requestMeta.isCompaction && !isValidCompactionText(this.text)) {
         const recovery = this.requestMeta.recoverySummary || buildCompactionRecoverySummary(null);
+        const metrics = compactionTextMetrics(this.text);
         this.bufferedMessageEvents = [];
         this.sawCompletedForwarded = true;
         const usage = usageFrom(evt);
-        diag(`COMPACTION_GUARD replaced_invalid_output chars=${this.text.length}; ${usageLine(usage)}`);
+        diag(`COMPACTION_GUARD replaced_invalid_output chars=${this.text.length} prefix=${Number(metrics.prefix)} headings=${metrics.present} forbidden=${Number(metrics.forbidden)}; ${usageLine(usage)}`);
         if (this.requestMeta.checkpointPath) updateCheckpointSummary(this.requestMeta.checkpointPath, recovery, usage);
         return this.recoveredCompactionEvents(evt, recovery);
       }
@@ -1151,6 +1173,8 @@ class SseTranslator {
       const usage = usageFrom(evt);
       diag(`${kind}; SSE_COMPLETED raw=1 forwarded=1; ${usageLine(usage)}`);
       if (this.requestMeta.isCompaction && this.requestMeta.checkpointPath) {
+        const metrics = compactionTextMetrics(this.text);
+        diag(`COMPACTION_SUMMARY accepted chars=${this.text.length} headings=${metrics.present} output_limit_hit=${Number((usage?.output_tokens || 0) >= COMPACT_MAX_OUTPUT_TOKENS)}`);
         updateCheckpointSummary(this.requestMeta.checkpointPath, this.text, usage);
       } else if (!this.sawToolCall && looksLikeProgressOnly(this.text)) {
         diag(`TURN_GUARD WARNING progress-only terminal assistant message=${JSON.stringify(this.text.slice(0, 500))}`);
@@ -1851,6 +1875,27 @@ function selftest() {
   ].join("\n");
   if (!isValidCompactionText(validCheckpoint) || isValidCompactionText(`${validCheckpoint}\n<tool_call>`)) {
     throw new Error("compaction output validation failed");
+  }
+  const markdownCheckpoint = [
+    "# CONTEXT CHECKPOINT SUMMARY",
+    "## CURRENT TASK",
+    "Текущая задача",
+    "## WORK COMPLETED",
+    "Выполненная работа",
+    "## STATE SNAPSHOT",
+    "Состояние",
+    "## OPEN ISSUES",
+    "Открытые вопросы"
+  ].join("\n");
+  if (!isValidCompactionText(markdownCheckpoint)) {
+    throw new Error("markdown compaction output validation failed");
+  }
+  const preservedCheckpoint = buildCompactionRecoverySummary({ input: [{
+    role: "user",
+    content: [{ type: "input_text", text: `Another language model started to solve this problem.\n${markdownCheckpoint}` }]
+  }] });
+  if (preservedCheckpoint !== markdownCheckpoint) {
+    throw new Error("previous checkpoint recovery preservation failed");
   }
   const recoverySummary = buildCompactionRecoverySummary({
     input: [{ role: "user", content: [{ type: "input_text", text: "Продолжить проверку проекта" }] }]

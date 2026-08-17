@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 MARKER = "generated_by_codex_proxy_llama_cpp"
 
 
@@ -162,10 +162,13 @@ def render_config(settings: Settings) -> str:
     catalog_path = settings.codex_home / "model_catalog.json"
     provider = "llamacpp_proxy"
     compact_prompt = (
-        "Create a dense continuation checkpoint for the next model. Preserve the current user request, exact progress, "
-        "changed files, tests, decisions, constraints, errors, identifiers, numeric limits, and the next concrete action. "
-        "Merge still-relevant facts from older checkpoints. Do not expose chain-of-thought. Do not call tools or continue "
-        "implementation. Output only the checkpoint."
+        "Interrupted. You are creating a CONTEXT CHECKPOINT SUMMARY for the next model. Output only a dense checkpoint "
+        "whose first line is # CONTEXT CHECKPOINT SUMMARY. Use these Markdown headings in order: ## CURRENT TASK, "
+        "## WORK COMPLETED, ## DECISIONS AND CONSTRAINTS, ## STATE SNAPSHOT, ## OPEN ISSUES, ## PARKED TASKS, "
+        "## NEXT ACTION. Preserve the current request, exact progress, changed files, tests, decisions, constraints, errors, "
+        "identifiers, numeric limits, and next concrete action. Merge still-relevant facts from older checkpoints without "
+        "thinning them. Target 1200-1600 tokens and finish every section before the output limit. Do not expose chain-of-thought, "
+        "call tools, or continue implementation."
     )
     lines = [
         f"# {MARKER} = {toml_string(VERSION)}",
