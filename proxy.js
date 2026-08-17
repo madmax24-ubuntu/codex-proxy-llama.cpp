@@ -2,7 +2,7 @@
 "use strict";
 
 /*
-  Codex <-> llama.cpp Responses compatibility proxy 1.0.4
+  Codex <-> llama.cpp Responses compatibility proxy 1.0.5
 
   Adds support for:
     - Codex namespace tools (MCP) -> flattened function tools for llama.cpp
@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.4";
+const VERSION = "1.0.5";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -55,6 +55,7 @@ const THINKING_MODE = String(process.env.CODEX_THINKING_MODE || "auto").toLowerC
 const FORCE_SERIAL_TOOL_CALLS = !/^(0|false|no)$/i.test(process.env.CODEX_FORCE_SERIAL_TOOL_CALLS || "1");
 const CHECKPOINT_DIR = process.env.CODEX_CHECKPOINT_DIR || path.join(__dirname, "checkpoints");
 const CHECKPOINT_BY_KEY = new Map();
+const CHECKPOINT_BY_SUMMARY = new Map();
 
 function log(...a) { console.log("[codex-llama-proxy]", ...a); }
 function debug(...a) { if (DEBUG) console.log("[codex-llama-proxy:debug]", ...a); }
@@ -104,6 +105,8 @@ function updateCheckpointSummary(file, summary, usage) {
     obj.usage = usage || null;
     obj.completed_at = new Date().toISOString();
     fs.writeFileSync(file, JSON.stringify(obj, null, 2), "utf8");
+    const hash = checkpointSummaryHash(summary);
+    if (hash) CHECKPOINT_BY_SUMMARY.set(hash, file);
   } catch (err) {
     diag(`CHECKPOINT update failed error=${err.message}`);
   }
@@ -131,6 +134,56 @@ function requestFingerprint(body) {
     return crypto.createHash("sha256").update(raw).digest("hex");
   } catch {
     return "";
+  }
+}
+
+function checkpointSummaryText(text) {
+  const source = String(text || "");
+  const match = source.match(/^#{0,6}\s*CONTEXT CHECKPOINT SUMMARY\b/m);
+  if (!match) return "";
+  return source.slice(match.index).split(/\n\n\[COLD MEMORY:/, 1)[0].trim();
+}
+
+function checkpointSummaryHash(text) {
+  const summary = checkpointSummaryText(text);
+  return summary ? crypto.createHash("sha256").update(summary).digest("hex") : "";
+}
+
+function checkpointForRequest(body, cacheKey, model) {
+  if (Array.isArray(body?.input)) {
+    for (let i = body.input.length - 1; i >= 0; i--) {
+      if (!isCompactionSummaryItem(body.input[i])) continue;
+      const hash = checkpointSummaryHash(messageContentText(body.input[i].content));
+      if (hash && CHECKPOINT_BY_SUMMARY.has(hash)) return CHECKPOINT_BY_SUMMARY.get(hash);
+    }
+  }
+  return CHECKPOINT_BY_KEY.get(cacheKey) || CHECKPOINT_BY_KEY.get(`model:${model || DEFAULT_MODEL}`) || null;
+}
+
+function restoreCheckpointIndex(limit = 256) {
+  try {
+    if (!fs.existsSync(CHECKPOINT_DIR)) return 0;
+    const files = fs.readdirSync(CHECKPOINT_DIR)
+      .filter(name => name.includes("-compaction-") && name.endsWith(".json"))
+      .sort().reverse().slice(0, limit);
+    let restored = 0;
+    for (const name of files) {
+      const file = path.join(CHECKPOINT_DIR, name);
+      let obj;
+      try { obj = JSON.parse(fs.readFileSync(file, "utf8")); } catch { continue; }
+      const body = obj?.payload?.request;
+      if (!body || typeof obj.compact_summary !== "string" || !obj.compact_summary) continue;
+      const keys = [requestCacheKey(body), `model:${body.model || DEFAULT_MODEL}`];
+      for (const key of keys) if (!CHECKPOINT_BY_KEY.has(key)) CHECKPOINT_BY_KEY.set(key, file);
+      const hash = checkpointSummaryHash(obj.compact_summary);
+      if (hash && !CHECKPOINT_BY_SUMMARY.has(hash)) CHECKPOINT_BY_SUMMARY.set(hash, file);
+      restored++;
+    }
+    diag(`CHECKPOINT index restored=${restored} summary_keys=${CHECKPOINT_BY_SUMMARY.size}`);
+    return restored;
+  } catch (err) {
+    diag(`CHECKPOINT index restore failed error=${err.message}`);
+    return 0;
   }
 }
 
@@ -1252,8 +1305,7 @@ function createServer() {
             applyCompactionPolicy(prepared.body);
             diag(`COMPACTION policy max_output_tokens=${COMPACT_MAX_OUTPUT_TOKENS} reasoning=${COMPACT_REASONING_EFFORT} thinking_budget=${COMPACT_REASONING_BUDGET}`);
           } else if (prepared.postCompactPruning?.foundSummary) {
-            const checkpoint = CHECKPOINT_BY_KEY.get(requestMeta.cacheKey) ||
-              CHECKPOINT_BY_KEY.get(`model:${parsed.model || DEFAULT_MODEL}`);
+            const checkpoint = checkpointForRequest(prepared.body, requestMeta.cacheKey, parsed.model);
             if (checkpoint && appendCheckpointHint(prepared.body, checkpoint)) {
               diag(`POST_COMPACT cold-memory hint=${checkpoint}`);
             }
@@ -1897,6 +1949,17 @@ function selftest() {
   if (preservedCheckpoint !== markdownCheckpoint) {
     throw new Error("previous checkpoint recovery preservation failed");
   }
+  const wrappedCheckpoint = `Another language model started to solve this problem and produced a summary of its thinking process.\n${markdownCheckpoint}`;
+  const checkpointHash = checkpointSummaryHash(wrappedCheckpoint);
+  if (!checkpointHash || checkpointHash !== checkpointSummaryHash(`${wrappedCheckpoint}\n\n[COLD MEMORY: test]`)) {
+    throw new Error("checkpoint summary identity normalization failed");
+  }
+  CHECKPOINT_BY_SUMMARY.set(checkpointHash, "checkpoint-selftest.json");
+  const matchedCheckpoint = checkpointForRequest({ input: [{ role: "user", content: wrappedCheckpoint }] }, "missing", DEFAULT_MODEL);
+  CHECKPOINT_BY_SUMMARY.delete(checkpointHash);
+  if (matchedCheckpoint !== "checkpoint-selftest.json") {
+    throw new Error("checkpoint summary identity lookup failed");
+  }
   const recoverySummary = buildCompactionRecoverySummary({
     input: [{ role: "user", content: [{ type: "input_text", text: "Продолжить проверку проекта" }] }]
   });
@@ -2021,6 +2084,7 @@ function selftest() {
 if (process.argv.includes("--selftest")) {
   selftest();
 } else {
+  restoreCheckpointIndex();
   const server = createServer();
   server.on("error", err => {
     diag(`SERVER_ERROR code=${err.code || "unknown"} error=${err.message}`);
