@@ -40,7 +40,7 @@ const DEFAULT_MODEL = process.env.CODEX_MODEL || "llm";
 const DEBUG = /^(1|true|yes)$/i.test(process.env.CODEX_PROXY_DEBUG || "");
 const DIAG_PATH = process.env.CODEX_PROXY_DIAG || path.join(__dirname, "proxy.log");
 const POST_COMPACT_OLD_USER_TOKEN_LIMIT = Math.max(0, Number(process.env.CODEX_POST_COMPACT_OLD_USER_TOKEN_LIMIT || "4096") || 0);
-const COMPACT_MAX_OUTPUT_TOKENS = Math.max(1024, Number(process.env.CODEX_COMPACT_MAX_OUTPUT_TOKENS || "3072") || 3072);
+const COMPACT_MAX_OUTPUT_TOKENS = Math.max(1024, Number(process.env.CODEX_COMPACT_MAX_OUTPUT_TOKENS || "4096") || 4096);
 const COMPACT_REASONING_EFFORT = String(process.env.CODEX_COMPACT_REASONING_EFFORT || "low").toLowerCase();
 const COMPACT_REASONING_BUDGET = Math.max(0, Number(process.env.CODEX_COMPACT_REASONING_BUDGET || "0") || 0);
 const REASONING_BUDGET_LOW = Math.max(0, Number(process.env.CODEX_REASONING_BUDGET_LOW || "0") || 0);
@@ -234,7 +234,7 @@ function applyCompactionPolicy(body, limit = COMPACT_MAX_OUTPUT_TOKENS) {
   }
   body.tool_choice = "none";
   body.parallel_tool_calls = false;
-  const contract = "COMPACTION OUTPUT CONTRACT: Return only a dense checkpoint in the configured user language. The first line must be # CONTEXT CHECKPOINT SUMMARY. Use Markdown headings in this order: CURRENT TASK, WORK COMPLETED, DECISIONS AND CONSTRAINTS, STATE SNAPSHOT, OPEN ISSUES, PARKED TASKS, NEXT ACTION. Preserve concrete state from previous checkpoints. Never emit tool calls, XML-like tool tags, chain-of-thought, or assistant commentary. Target 1200-1600 tokens and finish all sections before the output limit.";
+  const contract = "COMPACTION OUTPUT CONTRACT: Return only a dense checkpoint in the configured user language. The first line must be # CONTEXT CHECKPOINT SUMMARY. Use Markdown headings in this exact order: CURRENT TASK, WORK COMPLETED, DECISIONS AND CONSTRAINTS, STATE SNAPSHOT, OPEN ISSUES, PARKED TASKS, NEXT ACTION. Every heading is mandatory; write '- None.' when empty. Preserve concrete state from previous checkpoints. Never emit tool calls, XML-like tool tags, chain-of-thought, or assistant commentary. Target 1200-1800 tokens, start NEXT ACTION before token 2000, and finish it with a complete sentence.";
   const instructions = typeof body.instructions === "string" ? body.instructions.trim() : "";
   if (!instructions.includes("COMPACTION OUTPUT CONTRACT:")) {
     body.instructions = instructions ? `${instructions}\n\n${contract}` : contract;
@@ -541,25 +541,49 @@ function compactionTextMetrics(text) {
   const canonical = clean.replace(/^#{1,6}\s*/, "");
   const prefix = canonical.startsWith("CONTEXT CHECKPOINT SUMMARY");
   const forbidden = /<\/?tool_call\b|<function=|<parameter=|<\|(?:tool_call|im_start|im_end)\|>|assistant\s+to=/i.test(clean);
-  let offset = 0;
-  let present = 0;
-  let current = -1;
-  let completed = -1;
-  for (const heading of COMPACTION_REQUIRED_HEADINGS) {
-    const index = clean.indexOf(heading, offset);
-    if (index < offset) continue;
-    if (heading === "CURRENT TASK") current = index;
-    if (heading === "WORK COMPLETED") completed = index;
-    present++;
-    offset = index + heading.length;
+  const pattern = new RegExp(`^#{0,6}\\s*(${COMPACTION_REQUIRED_HEADINGS.join("|")})\\s*$`, "gmi");
+  const matches = [...clean.matchAll(pattern)];
+  const found = matches.map(match => match[1].toUpperCase());
+  const sections = new Map();
+  for (let i = 0; i < matches.length; i++) {
+    const start = matches[i].index + matches[i][0].length;
+    const end = i + 1 < matches.length ? matches[i + 1].index : clean.length;
+    const value = clean.slice(start, end).trim();
+    if (!sections.has(found[i]) && value) sections.set(found[i], value);
   }
-  return { clean, prefix, forbidden, present, current, completed };
+  const ordered = found.length === COMPACTION_REQUIRED_HEADINGS.length &&
+    found.every((heading, index) => heading === COMPACTION_REQUIRED_HEADINGS[index]);
+  return { clean, prefix, forbidden, present: sections.size, ordered, sections };
 }
 
 function isValidCompactionText(text) {
   const metrics = compactionTextMetrics(text);
-  return metrics.prefix && !metrics.forbidden && metrics.current >= 0 && metrics.completed > metrics.current &&
-    (metrics.present >= 4 || metrics.clean.length >= 1600);
+  return metrics.prefix && !metrics.forbidden && metrics.ordered &&
+    COMPACTION_REQUIRED_HEADINGS.every(heading => metrics.sections.has(heading));
+}
+
+function repairCompactionText(text, recovery = "", outputLimitHit = false) {
+  const generated = compactionTextMetrics(text);
+  const previous = compactionTextMetrics(recovery);
+  const fallback = {
+    "CURRENT TASK": "- Продолжить последний активный запрос пользователя.",
+    "WORK COMPLETED": "- Сверить уже выполненную работу с рабочей директорией и cold memory.",
+    "DECISIONS AND CONSTRAINTS": "- Сохранить пользовательские изменения, язык общения и действующие ограничения.",
+    "STATE SNAPSHOT": "- Полный transcript до сжатия сохранён в cold memory.",
+    "OPEN ISSUES": "- Определить оставшиеся пункты по рабочему состоянию и cold memory.",
+    "PARKED TASKS": "- Нет подтверждённых отложенных задач.",
+    "NEXT ACTION": "- Сверить рабочую директорию и cold memory, определить ближайший незавершённый шаг и продолжить без повторения завершённой работы."
+  };
+  const parts = ["# CONTEXT CHECKPOINT SUMMARY"];
+  for (const heading of COMPACTION_REQUIRED_HEADINGS) {
+    let value = generated.sections.get(heading) || previous.sections.get(heading) || fallback[heading];
+    if (heading === "NEXT ACTION" && outputLimitHit) {
+      const completeLines = value.split(/\r?\n/).filter(line => /[.!?…。！？)`\]}>]$/.test(line.trim()));
+      value = [...completeLines, fallback[heading]].join("\n");
+    }
+    parts.push(`## ${heading}`, value);
+  }
+  return parts.join("\n\n");
 }
 
 function cleanRecoveryText(text, limit = 4000) {
@@ -578,6 +602,8 @@ function buildCompactionRecoverySummary(body) {
     if (!match) continue;
     const prior = text.slice(match.index).trim();
     if (isValidCompactionText(prior)) return prior;
+    const repaired = repairCompactionText(prior);
+    if (isValidCompactionText(repaired)) return repaired;
   }
   const users = Array.isArray(body?.input)
     ? body.input.filter(isUserMessageItem).map(item => messageContentText(item.content).trim()).filter(Boolean)
@@ -1205,15 +1231,18 @@ class SseTranslator {
 
     if (evt.type === "response.completed") {
       normalizeCompletedForCodex(evt);
-      if (this.requestMeta.isCompaction && !isValidCompactionText(this.text)) {
+      const usage = usageFrom(evt);
+      const outputLimitHit = this.requestMeta.isCompaction &&
+        (usage?.output_tokens || 0) >= COMPACT_MAX_OUTPUT_TOKENS;
+      if (this.requestMeta.isCompaction && (!isValidCompactionText(this.text) || outputLimitHit)) {
         const recovery = this.requestMeta.recoverySummary || buildCompactionRecoverySummary(null);
+        const repaired = repairCompactionText(this.text, recovery, outputLimitHit);
         const metrics = compactionTextMetrics(this.text);
         this.bufferedMessageEvents = [];
         this.sawCompletedForwarded = true;
-        const usage = usageFrom(evt);
-        diag(`COMPACTION_GUARD replaced_invalid_output chars=${this.text.length} prefix=${Number(metrics.prefix)} headings=${metrics.present} forbidden=${Number(metrics.forbidden)}; ${usageLine(usage)}`);
-        if (this.requestMeta.checkpointPath) updateCheckpointSummary(this.requestMeta.checkpointPath, recovery, usage);
-        return this.recoveredCompactionEvents(evt, recovery);
+        diag(`COMPACTION_GUARD repaired_output chars=${this.text.length} prefix=${Number(metrics.prefix)} headings=${metrics.present} ordered=${Number(metrics.ordered)} forbidden=${Number(metrics.forbidden)} output_limit_hit=${Number(outputLimitHit)}; ${usageLine(usage)}`);
+        if (this.requestMeta.checkpointPath) updateCheckpointSummary(this.requestMeta.checkpointPath, repaired, usage);
+        return this.recoveredCompactionEvents(evt, repaired);
       }
       const suppressed = this.sawToolCall ? suppressMessagesWithToolCalls(evt.response) : 0;
       const buffered = this.sawToolCall ? [] : this.bufferedMessageEvents;
@@ -1223,7 +1252,6 @@ class SseTranslator {
       this.bufferedMessageEvents = [];
       this.sawCompletedForwarded = true;
       const kind = this.requestMeta.isCompaction ? "COMPACTION completed" : "response completed";
-      const usage = usageFrom(evt);
       diag(`${kind}; SSE_COMPLETED raw=1 forwarded=1; ${usageLine(usage)}`);
       if (this.requestMeta.isCompaction && this.requestMeta.checkpointPath) {
         const metrics = compactionTextMetrics(this.text);
@@ -1916,14 +1944,14 @@ function selftest() {
   }
 
   const validCheckpoint = [
-    "CONTEXT CHECKPOINT SUMMARY",
-    "CURRENT TASK",
-    "WORK COMPLETED",
-    "DECISIONS AND CONSTRAINTS",
-    "STATE SNAPSHOT",
-    "OPEN ISSUES",
-    "PARKED TASKS",
-    "NEXT ACTION"
+    "# CONTEXT CHECKPOINT SUMMARY",
+    "## CURRENT TASK", "Task.",
+    "## WORK COMPLETED", "Done.",
+    "## DECISIONS AND CONSTRAINTS", "Constraints.",
+    "## STATE SNAPSHOT", "State.",
+    "## OPEN ISSUES", "Issues.",
+    "## PARKED TASKS", "None.",
+    "## NEXT ACTION", "Continue."
   ].join("\n");
   if (!isValidCompactionText(validCheckpoint) || isValidCompactionText(`${validCheckpoint}\n<tool_call>`)) {
     throw new Error("compaction output validation failed");
@@ -1934,10 +1962,16 @@ function selftest() {
     "Текущая задача",
     "## WORK COMPLETED",
     "Выполненная работа",
+    "## DECISIONS AND CONSTRAINTS",
+    "Ограничения",
     "## STATE SNAPSHOT",
     "Состояние",
     "## OPEN ISSUES",
-    "Открытые вопросы"
+    "Открытые вопросы",
+    "## PARKED TASKS",
+    "Нет.",
+    "## NEXT ACTION",
+    "Продолжить."
   ].join("\n");
   if (!isValidCompactionText(markdownCheckpoint)) {
     throw new Error("markdown compaction output validation failed");
@@ -1982,9 +2016,15 @@ function selftest() {
   })));
   if (recoveredCompaction.length !== 7 ||
       recoveredCompaction.some(event => JSON.stringify(event).includes("<tool_call>")) ||
-      recoveredCompaction[2]?.delta !== recoverySummary ||
-      recoveredCompaction[6]?.response?.output?.[0]?.content?.[0]?.text !== recoverySummary) {
+      recoveredCompaction[2]?.delta !== repairCompactionText("<tool_call><function=shell_command>", recoverySummary) ||
+      recoveredCompaction[6]?.response?.output?.[0]?.content?.[0]?.text !== repairCompactionText("<tool_call><function=shell_command>", recoverySummary)) {
     throw new Error("invalid compaction recovery failed");
+  }
+
+  const clippedCheckpoint = `${validCheckpoint}\nНезавершённый фрагмент`;
+  const repairedClipped = repairCompactionText(clippedCheckpoint, recoverySummary, true);
+  if (!isValidCompactionText(repairedClipped) || repairedClipped.endsWith("Незавершённый фрагмент")) {
+    throw new Error("truncated compaction repair failed");
   }
 
   const compactProbe = {

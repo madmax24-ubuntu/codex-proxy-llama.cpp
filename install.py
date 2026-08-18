@@ -167,7 +167,8 @@ def render_config(settings: Settings) -> str:
         "## WORK COMPLETED, ## DECISIONS AND CONSTRAINTS, ## STATE SNAPSHOT, ## OPEN ISSUES, ## PARKED TASKS, "
         "## NEXT ACTION. Preserve the current request, exact progress, changed files, tests, decisions, constraints, errors, "
         "identifiers, numeric limits, and next concrete action. Merge still-relevant facts from older checkpoints without "
-        "thinning them. Target 1200-1600 tokens and finish every section before the output limit. Do not expose chain-of-thought, "
+        "thinning them. Every heading is mandatory; write '- None.' when empty. Target 1200-1800 tokens, start NEXT ACTION "
+        "before token 2000, and finish it with a complete sentence. Do not expose chain-of-thought, "
         "call tools, or continue implementation."
     )
     lines = [
@@ -271,7 +272,7 @@ def proxy_environment(settings: Settings) -> dict[str, str]:
         "CODEX_REASONING_BUDGET_MEDIUM": str(settings.reasoning_budgets["medium"]),
         "CODEX_REASONING_BUDGET_HIGH": str(settings.reasoning_budgets["high"]),
         "CODEX_REASONING_BUDGET_XHIGH": str(settings.reasoning_budgets["xhigh"]),
-        "CODEX_COMPACT_MAX_OUTPUT_TOKENS": "3072",
+        "CODEX_COMPACT_MAX_OUTPUT_TOKENS": "4096",
         "CODEX_COMPACT_REASONING_BUDGET": "0",
         "CODEX_FORCE_SERIAL_TOOL_CALLS": "1",
         "CODEX_CHECKPOINT_DIR": str(settings.codex_home / "checkpoints"),
