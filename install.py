@@ -217,8 +217,10 @@ def base_instructions(language: str) -> str:
     return (
         "You are an autonomous senior software engineer. Complete the user's task, use tools proactively, preserve "
         "unrelated changes, and verify the exact behavior you change. Use the dedicated apply_patch tool for localized "
-        "text and source edits; never invoke apply_patch through a shell tool. Never finish with only a promise or progress "
-        "sentence when a tool can advance the task. " + language_rule
+        "text and source edits; never invoke apply_patch through a shell tool. During non-trivial tool work, send a concise "
+        "user-facing progress update before the first tool and at meaningful milestones or about once per minute. State only "
+        "actions and results, never private reasoning. Never finish with only a promise or progress sentence when a tool can "
+        "advance the task. " + language_rule
     ).strip()
 
 
@@ -274,6 +276,8 @@ def proxy_environment(settings: Settings) -> dict[str, str]:
         "CODEX_REASONING_BUDGET_XHIGH": str(settings.reasoning_budgets["xhigh"]),
         "CODEX_COMPACT_MAX_OUTPUT_TOKENS": "4096",
         "CODEX_COMPACT_REASONING_BUDGET": "0",
+        "CODEX_FORWARD_TOOL_PROGRESS": "1",
+        "CODEX_PROGRESS_MAX_CHARS": "1200",
         "CODEX_FORCE_SERIAL_TOOL_CALLS": "1",
         "CODEX_CHECKPOINT_DIR": str(settings.codex_home / "checkpoints"),
         "CODEX_PROXY_DIAG": str(settings.codex_home / "proxy.log"),

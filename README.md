@@ -189,6 +189,8 @@ The installer creates:
 | `CODEX_REASONING_LEVELS` | Comma-separated supported levels | `low,medium,high` |
 | `CODEX_FORCE_SERIAL_TOOL_CALLS` | Force serial tool calls | `1` |
 | `CODEX_COMPACT_MAX_OUTPUT_TOKENS` | Compaction output cap | `4096` |
+| `CODEX_FORWARD_TOOL_PROGRESS` | Forward concise assistant updates before tool calls | `1` |
+| `CODEX_PROGRESS_MAX_CHARS` | Maximum length of a forwarded tool-progress update | `1200` |
 | `CODEX_CHECKPOINT_DIR` | Cold-checkpoint directory | `./checkpoints` |
 | `CODEX_PROXY_DIAG` | Diagnostic log path | `./proxy.log` |
 

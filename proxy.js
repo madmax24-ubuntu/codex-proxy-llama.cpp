@@ -43,6 +43,8 @@ const POST_COMPACT_OLD_USER_TOKEN_LIMIT = Math.max(0, Number(process.env.CODEX_P
 const COMPACT_MAX_OUTPUT_TOKENS = Math.max(1024, Number(process.env.CODEX_COMPACT_MAX_OUTPUT_TOKENS || "4096") || 4096);
 const COMPACT_REASONING_EFFORT = String(process.env.CODEX_COMPACT_REASONING_EFFORT || "low").toLowerCase();
 const COMPACT_REASONING_BUDGET = Math.max(0, Number(process.env.CODEX_COMPACT_REASONING_BUDGET || "0") || 0);
+const FORWARD_TOOL_PROGRESS = !/^(0|false|no)$/i.test(process.env.CODEX_FORWARD_TOOL_PROGRESS || "1");
+const PROGRESS_MAX_CHARS = Math.max(120, Number(process.env.CODEX_PROGRESS_MAX_CHARS || "1200") || 1200);
 const REASONING_BUDGET_LOW = Math.max(0, Number(process.env.CODEX_REASONING_BUDGET_LOW || "0") || 0);
 const REASONING_BUDGET_MEDIUM = Math.max(0, Number(process.env.CODEX_REASONING_BUDGET_MEDIUM || "0") || 0);
 const REASONING_BUDGET_HIGH = Math.max(0, Number(process.env.CODEX_REASONING_BUDGET_HIGH || "0") || 0);
@@ -935,12 +937,45 @@ function rewriteResponseObject(obj, maps) {
   }
 }
 
-function suppressMessagesWithToolCalls(obj) {
+function isSafeProgressText(text) {
+  const value = String(text || "").trim();
+  if (!value || value.length > PROGRESS_MAX_CHARS) return false;
+  if (/<\/?tool_call\b|<function=|<parameter=|<\|(?:tool_call|im_start|im_end)\|>|assistant\s+to=/i.test(value)) return false;
+  if (/```|^\s*[\[{][\s\S]*(?:"command"|"arguments"|"call_id")/i.test(value)) return false;
+  if (/^(?:analysis|reasoning|thoughts?|we need|i need|i should|let(?:'s| us) (?:analy[sz]e|reason|think)|now i (?:understand|see)|hmm|wait\b|interesting\b|анализ|рассуждени|мне нужно|нам нужно|надо подумать|хм\b|стоп\b|интересно\b)/i.test(value)) return false;
+  return value.split(/\r?\n/).length <= 10 && value.split(/[.!?…。！？]+/).filter(Boolean).length <= 8;
+}
+
+function safeProgressMessageIds(obj) {
+  const ids = new Set();
+  if (!FORWARD_TOOL_PROGRESS || !obj || typeof obj !== "object" || !Array.isArray(obj.output)) return ids;
+  for (const item of obj.output) {
+    if (item?.type !== "message" || !isSafeProgressText(messageContentText(item.content))) continue;
+    const id = item.id || item.call_id;
+    if (id) ids.add(id);
+  }
+  return ids;
+}
+
+function bufferedMessageEventId(encoded) {
+  try {
+    const event = JSON.parse(String(encoded).replace(/^data:\s*/, "").trim());
+    return event.item_id || event.item?.id || event.item?.call_id || "";
+  } catch {
+    return "";
+  }
+}
+
+function suppressMessagesWithToolCalls(obj, keepMessageIds = new Set()) {
   if (!obj || typeof obj !== "object" || !Array.isArray(obj.output)) return 0;
   const hasToolCall = obj.output.some(x => x && (x.type === "function_call" || x.type === "custom_tool_call"));
   if (!hasToolCall) return 0;
   const before = obj.output.length;
-  obj.output = obj.output.filter(x => !x || x.type !== "message");
+  obj.output = obj.output.filter(x => {
+    if (!x || x.type !== "message") return true;
+    const id = x.id || x.call_id;
+    return !!id && keepMessageIds.has(id);
+  });
   return before - obj.output.length;
 }
 
@@ -1244,10 +1279,13 @@ class SseTranslator {
         if (this.requestMeta.checkpointPath) updateCheckpointSummary(this.requestMeta.checkpointPath, repaired, usage);
         return this.recoveredCompactionEvents(evt, repaired);
       }
-      const suppressed = this.sawToolCall ? suppressMessagesWithToolCalls(evt.response) : 0;
-      const buffered = this.sawToolCall ? [] : this.bufferedMessageEvents;
+      const safeProgressIds = this.sawToolCall ? safeProgressMessageIds(evt.response) : new Set();
+      const suppressed = this.sawToolCall ? suppressMessagesWithToolCalls(evt.response, safeProgressIds) : 0;
+      const buffered = this.sawToolCall
+        ? this.bufferedMessageEvents.filter(event => safeProgressIds.has(bufferedMessageEventId(event)))
+        : this.bufferedMessageEvents;
       if (this.sawToolCall && this.bufferedMessageEvents.length) {
-        diag(`CHATTER_SUPPRESSED events=${this.bufferedMessageEvents.length} messages=${suppressed}`);
+        diag(`TOOL_PROGRESS forwarded_messages=${safeProgressIds.size} forwarded_events=${buffered.length} suppressed_messages=${suppressed}`);
       }
       this.bufferedMessageEvents = [];
       this.sawCompletedForwarded = true;
@@ -1492,8 +1530,11 @@ function createServer() {
               try {
                 const obj = JSON.parse(raw.toString("utf8"));
                 rewriteResponseObject(obj, maps);
-                const suppressed = suppressMessagesWithToolCalls(obj);
-                if (suppressed) diag(`CHATTER_SUPPRESSED messages=${suppressed} nonstream=1`);
+                const safeProgressIds = safeProgressMessageIds(obj);
+                const suppressed = suppressMessagesWithToolCalls(obj, safeProgressIds);
+                if (suppressed || safeProgressIds.size) {
+                  diag(`TOOL_PROGRESS forwarded_messages=${safeProgressIds.size} suppressed_messages=${suppressed} nonstream=1`);
+                }
                 output = Buffer.from(JSON.stringify(obj));
                 if ((ures.statusCode || 200) >= 400) {
                   const kind = requestMeta.isCompaction ? "COMPACTION upstream error" : "upstream error";
@@ -1913,10 +1954,29 @@ function selftest() {
       ]
     }
   })));
-  if (toolChatterCompleted.length !== 1 ||
-      toolChatterCompleted[0]?.type !== "response.completed" ||
-      toolChatterCompleted[0]?.response?.output?.some(x => x.type === "message")) {
-    throw new Error("tool-step assistant chatter suppression failed");
+  if (FORWARD_TOOL_PROGRESS &&
+      (toolChatterCompleted.length !== 3 ||
+       toolChatterCompleted[0]?.type !== "response.output_item.added" ||
+       toolChatterCompleted[1]?.type !== "response.output_text.delta" ||
+       !toolChatterCompleted[2]?.response?.output?.some(x => x.type === "message"))) {
+    throw new Error("safe tool-progress forwarding failed");
+  }
+  if (!FORWARD_TOOL_PROGRESS &&
+      (toolChatterCompleted.length !== 1 ||
+       toolChatterCompleted[0]?.response?.output?.some(x => x.type === "message"))) {
+    throw new Error("disabled tool-progress suppression failed");
+  }
+
+  const unsafeProgress = {
+    output: [
+      { id: "msg_reasoning", type: "message", role: "assistant", content: [{ type: "output_text", text: "Wait, I need to reason through every branch before I call the tool." }] },
+      { id: "fc_reasoning", type: "function_call", call_id: "call_reasoning", name: "shell_command", arguments: "{}" }
+    ]
+  };
+  const unsafeIds = safeProgressMessageIds(unsafeProgress);
+  suppressMessagesWithToolCalls(unsafeProgress, unsafeIds);
+  if (unsafeProgress.output.some(x => x.type === "message")) {
+    throw new Error("unsafe tool chatter was forwarded");
   }
 
   const finalMessage = new SseTranslator(p.maps);
