@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.6";
+const VERSION = "1.0.7";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -473,14 +473,29 @@ function extractApplyPatchFromShellArgs(args) {
 function normalizeToolOutputArray(item) {
   if (item && item.type === "function_call_output" && Array.isArray(item.output)) {
     item.output = item.output.map(block => {
-      if (!block || typeof block !== "object") return block;
+      if (!block || typeof block !== "object") {
+        return { type: "input_text", text: String(block ?? "") };
+      }
       const b = clone(block);
-      if (typeof b.text === "string") b.type = "input_text";
-      else if (b.type && b.type !== "input_text") b.type = "input_text";
-      return b;
+      let text = typeof b.text === "string" ? b.text : null;
+      if (text == null && typeof b.content === "string") text = b.content;
+      if (text == null && (b.type === "image_url" || b.type === "input_image" || b.image_url)) {
+        text = `[Image attached: ${b.image_url?.url ? "data:image" : (b.type || "image")}]`;
+      }
+      if (text == null) {
+        try { text = JSON.stringify(b); } catch { text = ""; }
+      }
+      return { type: "input_text", text };
     });
   } else if (item && item.type === "function_call_output" && typeof item.output === "string") {
     item.output = [{ type: "input_text", text: item.output }];
+  } else if (item && item.type === "function_call_output" && item.output && typeof item.output === "object") {
+    let text = typeof item.output.text === "string" ? item.output.text : null;
+    if (text == null && typeof item.output.content === "string") text = item.output.content;
+    if (text == null) {
+      try { text = JSON.stringify(item.output); } catch { text = ""; }
+    }
+    item.output = [{ type: "input_text", text }];
   }
 }
 
