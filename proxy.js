@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.3";
+const VERSION = "1.0.4";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -476,8 +476,11 @@ function normalizeToolOutputArray(item) {
       if (!block || typeof block !== "object") return block;
       const b = clone(block);
       if (typeof b.text === "string") b.type = "input_text";
+      else if (b.type && b.type !== "input_text") b.type = "input_text";
       return b;
     });
+  } else if (item && item.type === "function_call_output" && typeof item.output === "string") {
+    item.output = [{ type: "input_text", text: item.output }];
   }
 }
 
@@ -764,6 +767,35 @@ function normalizeInstructionMessages(body) {
   return { moved, roles };
 }
 
+function pruneOrphanProgressMessages(body) {
+  if (!body || !Array.isArray(body.input) || !FORWARD_TOOL_PROGRESS) return 0;
+  const input = body.input;
+  const toolCallIds = new Set();
+  const toolOutputIds = new Set();
+  for (const item of input) {
+    if (!item || typeof item !== "object") continue;
+    if (item.type === "function_call" || item.type === "custom_tool_call") {
+      const id = item.id || item.call_id;
+      if (id) toolCallIds.add(id);
+    }
+    if (item.type === "function_call_output" || item.type === "custom_tool_call_output") {
+      const id = item.call_id || item.id;
+      if (id) toolOutputIds.add(id);
+    }
+  }
+  const before = input.length;
+  body.input = input.filter(item => {
+    if (!item || typeof item !== "object") return true;
+    if (item.type !== "message" || item.role !== "assistant") return true;
+    const id = item.id || item.call_id;
+    if (!id) return false;
+    return toolCallIds.has(id) || toolOutputIds.has(id);
+  });
+  const removed = before - body.input.length;
+  if (removed) diag(`PROGRESS_PRUNE removed orphan assistant progress messages count=${removed}`);
+  return removed;
+}
+
 function rewriteHistoryNode(node, maps, repairs = []) {
   if (Array.isArray(node)) {
     for (const x of node) rewriteHistoryNode(x, maps, repairs);
@@ -864,6 +896,7 @@ function prepareRequest(original) {
   const reasoningNormalization = normalizeReasoningEffort(body);
   const instructionNormalization = normalizeInstructionMessages(body);
   const postCompactPruning = prunePostCompactionUserHistory(body);
+  pruneOrphanProgressMessages(body);
   rewriteTools(body, maps);
   const historyRepairs = rewriteHistoryNode(body.input, maps);
 
