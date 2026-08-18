@@ -2,7 +2,7 @@
 "use strict";
 
 /*
-  Codex <-> llama.cpp Responses compatibility proxy 1.0.2
+  Codex <-> llama.cpp Responses compatibility proxy 1.0.3
 
   Adds support for:
     - Codex namespace tools (MCP) -> flattened function tools for llama.cpp
@@ -13,13 +13,13 @@
     - removal of hosted web_search (use MCP web search instead)
     - configurable reasoning-effort passthrough and per-request thinking budgets
     - native Responses transport retained end-to-end (no Responses -> Chat conversion)
-    - fast structured compaction with tools disabled
+    - guarded structured compaction with automatic truncated-summary repair
     - preserves the current real user goal + canonical initial context after compaction
     - removes only older retained user messages, not the live task state
     - JSON cold checkpoints for exact pre-compaction recovery
     - transparent SSE bridge: every downstream JSON chunk is a complete SSE event
     - Codex-compatible response.completed usage normalization
-    - tool-step assistant chatter suppression and no ordinary shell-call interception
+    - safe user-facing progress forwarding without exposing internal reasoning
 
   No npm packages required.
 */
@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.2";
+const VERSION = "1.0.3";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
