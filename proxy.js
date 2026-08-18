@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.5";
+const VERSION = "1.0.6";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -61,7 +61,7 @@ const CHECKPOINT_BY_SUMMARY = new Map();
 
 function log(...a) { console.log("[codex-llama-proxy]", ...a); }
 function debug(...a) { if (DEBUG) console.log("[codex-llama-proxy:debug]", ...a); }
-function diag(line) { try { fs.appendFileSync(DIAG_PATH, `[${new Date().toISOString()}] ${line}\n`); } catch {} }
+function diag(line) { try { fs.appendFileSync(DIAG_PATH, `[${new Date().toISOString()}] ${line}\n`); } catch { } }
 function clone(x) { return JSON.parse(JSON.stringify(x)); }
 
 function safeMkdir(dir) {
@@ -422,7 +422,7 @@ function decodeCustomArgs(name, args) {
     if (parsed && typeof parsed[key] === "string") decoded = parsed[key];
     else if (parsed && typeof parsed.input === "string") decoded = parsed.input;
     else if (parsed && typeof parsed.patch === "string") decoded = parsed.patch;
-  } catch {}
+  } catch { }
   const normalized = name === "apply_patch" ? normalizeApplyPatchInput(decoded) : decoded;
   if (normalized !== decoded) diag("EDIT normalized apply_patch protocol headers");
   return normalized;
@@ -435,7 +435,7 @@ function shellCommandText(args) {
     if (typeof parsed?.command === "string") return parsed.command;
     if (Array.isArray(parsed?.command)) return parsed.command.join(" ");
     if (typeof parsed?.cmd === "string") return parsed.cmd;
-  } catch {}
+  } catch { }
   return args;
 }
 
@@ -506,7 +506,7 @@ function messageContentText(content) {
       }
       // System/developer messages should be textual. If an unfamiliar block
       // appears, preserve it rather than silently discarding instructions.
-      try { parts.push(JSON.stringify(block)); } catch {}
+      try { parts.push(JSON.stringify(block)); } catch { }
     }
     return parts.filter(Boolean).join("\n");
   }
@@ -805,9 +805,9 @@ function rewriteHistoryNode(node, maps, repairs = []) {
 
   // Codex namespaced function call -> flat llama.cpp function call.
   if (node.type === "function_call" &&
-      typeof node.name === "string" &&
-      typeof node.namespace === "string" &&
-      node.namespace) {
+    typeof node.name === "string" &&
+    typeof node.namespace === "string" &&
+    node.namespace) {
     node.name = flatNs(node.namespace, node.name);
     delete node.namespace;
   }
@@ -930,7 +930,7 @@ function convertFunctionItem(item, maps) {
 
 
   if ((item.name === "shell_command" || item.name === "exec_command") &&
-      looksLikeDirectFileWrite(shellCommandText(item.arguments))) {
+    looksLikeDirectFileWrite(shellCommandText(item.arguments))) {
     diag(`EDIT WARNING direct file write requested through ${item.name}; prefer native apply_patch for localized source/config edits`);
   }
 
@@ -1220,9 +1220,9 @@ class SseTranslator {
     // decode the wrapper back to freeform text. Normal messages, reasoning,
     // namespace calls and shell calls remain streaming and untouched.
     if (evt.type === "response.output_item.added" &&
-        evt.item?.type === "function_call" &&
-        typeof evt.item.name === "string" &&
-        this.maps.customByName.has(evt.item.name)) {
+      evt.item?.type === "function_call" &&
+      typeof evt.item.name === "string" &&
+      this.maps.customByName.has(evt.item.name)) {
       const id = evt.item.id || evt.item.call_id;
       this.customItems.set(id, {
         name: evt.item.name,
@@ -1335,7 +1335,7 @@ class SseTranslator {
     } else if (evt.type === "response.failed" || evt.type === "error" || evt.type === "response.incomplete") {
       const kind = this.requestMeta.isCompaction ? "COMPACTION failed" : "response failed";
       let detail = "";
-      try { detail = JSON.stringify(evt.error ?? evt).slice(0, 4000); } catch {}
+      try { detail = JSON.stringify(evt.error ?? evt).slice(0, 4000); } catch { }
       diag(`${kind}; ${detail}`);
     }
 
@@ -1509,7 +1509,7 @@ function createServer() {
                   const payload = line.slice(5).trimStart();
                   if (payload === "[DONE]") sawDoneMarker = true;
                   else {
-                    try { if (JSON.parse(payload)?.type === "response.completed") sawResponseCompleted = true; } catch {}
+                    try { if (JSON.parse(payload)?.type === "response.completed") sawResponseCompleted = true; } catch { }
                   }
                 }
                 for (const outLine of tr.translate(line)) res.write(outLine);
@@ -1525,7 +1525,7 @@ function createServer() {
                   const payload = pending.slice(5).trimStart();
                   if (payload === "[DONE]") sawDoneMarker = true;
                   else {
-                    try { if (JSON.parse(payload)?.type === "response.completed") sawResponseCompleted = true; } catch {}
+                    try { if (JSON.parse(payload)?.type === "response.completed") sawResponseCompleted = true; } catch { }
                   }
                 }
                 for (const outLine of tr.translate(pending)) res.write(outLine);
@@ -1583,7 +1583,7 @@ function createServer() {
                     diag(`TURN_GUARD WARNING progress-only terminal assistant message=${JSON.stringify(responseText.slice(0, 500))}`);
                   }
                 }
-              } catch {}
+              } catch { }
             } else if ((ures.statusCode || 200) >= 400 && raw.length) {
               const kind = requestMeta.isCompaction ? "COMPACTION upstream error" : "upstream error";
               diag(`${kind} status=${ures.statusCode || 0} body=${raw.toString("utf8").slice(0, 4000)}`);
@@ -1676,7 +1676,7 @@ function selftest() {
   const malformedPatch = "*** begin patch\n*** Update file: fixture.txt\n@@\n-old\n+new\n*** end patch";
   const normalizedPatch = decodeCustomArgs("apply_patch", JSON.stringify({ patch: malformedPatch }));
   if (!normalizedPatch.startsWith("*** Begin Patch\n*** Update File: fixture.txt") ||
-      !normalizedPatch.endsWith("*** End Patch")) {
+    !normalizedPatch.endsWith("*** End Patch")) {
     throw new Error("apply_patch protocol header normalization failed");
   }
   if (!p.body.tools.find(x => x.name === "mcp__demo__ping")) {
@@ -1715,11 +1715,11 @@ function selftest() {
   rewriteResponseObject(response, p.maps);
 
   if (response.output[0].type !== "custom_tool_call" ||
-      response.output[0].input.indexOf("*** Begin Patch") === -1) {
+    response.output[0].input.indexOf("*** Begin Patch") === -1) {
     throw new Error("function->custom apply_patch response conversion failed");
   }
   if (response.output[1].namespace !== "mcp__demo" ||
-      response.output[1].name !== "ping") {
+    response.output[1].name !== "ping") {
     throw new Error("namespace response unflatten failed");
   }
 
@@ -1746,7 +1746,7 @@ function selftest() {
   };
   rewriteResponseObject(largeResponse, p.maps);
   if (largeResponse.output[0].type !== "custom_tool_call" ||
-      largeResponse.output[0].input !== largePatch) {
+    largeResponse.output[0].input !== largePatch) {
     throw new Error("3000-line apply_patch round-trip failed");
   }
 
@@ -1770,7 +1770,7 @@ function selftest() {
   }));
   const doneText = doneLines.join("");
   if (!doneText.includes('"type":"response.custom_tool_call_input.done"') ||
-      !doneText.includes("line-1500-edited")) {
+    !doneText.includes("line-1500-edited")) {
     throw new Error("streamed 3000-line apply_patch translation failed");
   }
 
@@ -1780,14 +1780,14 @@ function selftest() {
   const shellPrepared = prepareRequest(shellReq);
   const shellTool = shellPrepared.body.tools.find(x => x.name === "shell_command");
   if (!shellTool?.description?.includes("NEVER invoke apply_patch through this shell tool") ||
-      !shellTool.description.includes("3000+ line files") ||
-      shellTool.description.includes("Fallback form:")) {
+    !shellTool.description.includes("3000+ line files") ||
+    shellTool.description.includes("Fallback form:")) {
     throw new Error("shell editing guidance injection failed");
   }
 
   if (!looksLikeDirectFileWrite('Set-Content -Path "x.js" -Value $code') ||
-      !looksLikeDirectFileWrite('[System.IO.File]::WriteAllText("x.js", $code)') ||
-      looksLikeDirectFileWrite('Get-Content x.js | Select-Object -First 20')) {
+    !looksLikeDirectFileWrite('[System.IO.File]::WriteAllText("x.js", $code)') ||
+    looksLikeDirectFileWrite('Get-Content x.js | Select-Object -First 20')) {
     throw new Error("direct file-write detection failed");
   }
 
@@ -1808,10 +1808,10 @@ function selftest() {
   // into one invalid JSON event. Every synthetic event must now parse alone.
   const customFramed = parseSseJsonEvents(doneLines);
   if (customFramed.length !== 4 ||
-      customFramed[0]?.type !== "response.output_item.added" ||
-      customFramed[1]?.type !== "response.custom_tool_call_input.delta" ||
-      customFramed[2]?.type !== "response.custom_tool_call_input.done" ||
-      customFramed[3]?.type !== "response.output_item.done") {
+    customFramed[0]?.type !== "response.output_item.added" ||
+    customFramed[1]?.type !== "response.custom_tool_call_input.delta" ||
+    customFramed[2]?.type !== "response.custom_tool_call_input.done" ||
+    customFramed[3]?.type !== "response.output_item.done") {
     throw new Error(`custom tool SSE framing failed: ${JSON.stringify(customFramed.map(x => x?.type || x))}`);
   }
 
@@ -1849,8 +1849,8 @@ function selftest() {
     item: { id: "fc_shell_stream", type: "function_call", call_id: "call_shell_stream", name: "shell_command", arguments: JSON.stringify({ command: shellPatchCommand }) }
   }));
   if (shellAdded.length !== 1 || shellArgs.length !== 1 || shellDone.length !== 1 ||
-      !shellAdded[0].includes('"name":"shell_command"') ||
-      !shellDone[0].includes('"name":"shell_command"')) {
+    !shellAdded[0].includes('"name":"shell_command"') ||
+    !shellDone[0].includes('"name":"shell_command"')) {
     throw new Error("ordinary shell stream transparency failed");
   }
   for (const part of [shellAdded, shellArgs, shellDone]) parseSseJsonEvents(part);
@@ -1882,9 +1882,9 @@ function selftest() {
   }));
   const completedParsed = parseSseJsonEvents(completedOut);
   if (completedParsed.length !== 1 || completedParsed[0]?.type !== "response.completed" ||
-      completedParsed[0]?.response?.id !== "resp_selftest" ||
-      completedParsed[0]?.response?.usage !== undefined ||
-      completedStream.sawCompletedForwarded !== true) {
+    completedParsed[0]?.response?.id !== "resp_selftest" ||
+    completedParsed[0]?.response?.usage !== undefined ||
+    completedStream.sawCompletedForwarded !== true) {
     throw new Error("response.completed framing/normalization failed");
   }
 
@@ -1913,8 +1913,8 @@ function selftest() {
     throw new Error("serial tool-call enforcement failed");
   }
   if (usesTemplateThinking(profileDefaults.body) &&
-      (profileDefaults.body.chat_template_kwargs?.enable_thinking !== true ||
-       profileDefaults.body.chat_template_kwargs?.preserve_thinking !== true)) {
+    (profileDefaults.body.chat_template_kwargs?.enable_thinking !== true ||
+      profileDefaults.body.chat_template_kwargs?.preserve_thinking !== true)) {
     throw new Error("template thinking defaults failed");
   }
   const explicitThinking = prepareRequest({
@@ -1923,7 +1923,7 @@ function selftest() {
     chat_template_kwargs: { enable_thinking: false, preserve_thinking: false }
   });
   if (explicitThinking.body.chat_template_kwargs.enable_thinking !== false ||
-      explicitThinking.body.chat_template_kwargs.preserve_thinking !== false) {
+    explicitThinking.body.chat_template_kwargs.preserve_thinking !== false) {
     throw new Error("explicit Qwen chat_template_kwargs were overwritten");
   }
 
@@ -1988,15 +1988,15 @@ function selftest() {
     }
   })));
   if (FORWARD_TOOL_PROGRESS &&
-      (toolChatterCompleted.length !== 3 ||
-       toolChatterCompleted[0]?.type !== "response.output_item.added" ||
-       toolChatterCompleted[1]?.type !== "response.output_text.delta" ||
-       !toolChatterCompleted[2]?.response?.output?.some(x => x.type === "message"))) {
+    (toolChatterCompleted.length !== 3 ||
+      toolChatterCompleted[0]?.type !== "response.output_item.added" ||
+      toolChatterCompleted[1]?.type !== "response.output_text.delta" ||
+      !toolChatterCompleted[2]?.response?.output?.some(x => x.type === "message"))) {
     throw new Error("safe tool-progress forwarding failed");
   }
   if (!FORWARD_TOOL_PROGRESS &&
-      (toolChatterCompleted.length !== 1 ||
-       toolChatterCompleted[0]?.response?.output?.some(x => x.type === "message"))) {
+    (toolChatterCompleted.length !== 1 ||
+      toolChatterCompleted[0]?.response?.output?.some(x => x.type === "message"))) {
     throw new Error("disabled tool-progress suppression failed");
   }
 
@@ -2030,9 +2030,9 @@ function selftest() {
     response: { id: "resp_final", status: "completed", output: [] }
   })));
   if (finalMessageCompleted.length !== 3 ||
-      finalMessageCompleted[0]?.type !== "response.output_item.added" ||
-      finalMessageCompleted[1]?.type !== "response.output_text.delta" ||
-      finalMessageCompleted[2]?.type !== "response.completed") {
+    finalMessageCompleted[0]?.type !== "response.output_item.added" ||
+    finalMessageCompleted[1]?.type !== "response.output_text.delta" ||
+    finalMessageCompleted[2]?.type !== "response.completed") {
     throw new Error("final assistant message buffering failed");
   }
 
@@ -2069,10 +2069,12 @@ function selftest() {
   if (!isValidCompactionText(markdownCheckpoint)) {
     throw new Error("markdown compaction output validation failed");
   }
-  const preservedCheckpoint = buildCompactionRecoverySummary({ input: [{
-    role: "user",
-    content: [{ type: "input_text", text: `Another language model started to solve this problem.\n${markdownCheckpoint}` }]
-  }] });
+  const preservedCheckpoint = buildCompactionRecoverySummary({
+    input: [{
+      role: "user",
+      content: [{ type: "input_text", text: `Another language model started to solve this problem.\n${markdownCheckpoint}` }]
+    }]
+  });
   if (preservedCheckpoint !== markdownCheckpoint) {
     throw new Error("previous checkpoint recovery preservation failed");
   }
@@ -2108,9 +2110,9 @@ function selftest() {
     response: { id: "resp_bad_compaction", status: "completed", output: [] }
   })));
   if (recoveredCompaction.length !== 7 ||
-      recoveredCompaction.some(event => JSON.stringify(event).includes("<tool_call>")) ||
-      recoveredCompaction[2]?.delta !== repairCompactionText("<tool_call><function=shell_command>", recoverySummary) ||
-      recoveredCompaction[6]?.response?.output?.[0]?.content?.[0]?.text !== repairCompactionText("<tool_call><function=shell_command>", recoverySummary)) {
+    recoveredCompaction.some(event => JSON.stringify(event).includes("<tool_call>")) ||
+    recoveredCompaction[2]?.delta !== repairCompactionText("<tool_call><function=shell_command>", recoverySummary) ||
+    recoveredCompaction[6]?.response?.output?.[0]?.content?.[0]?.text !== repairCompactionText("<tool_call><function=shell_command>", recoverySummary)) {
     throw new Error("invalid compaction recovery failed");
   }
 
@@ -2129,10 +2131,12 @@ function selftest() {
   if (!isCompactionRequest(compactProbe)) {
     throw new Error("compaction request detection failed");
   }
-  if (isCompactionRequest({ input: [
-    { role: "user", content: [{ type: "input_text", text: "Another language model started to solve this problem. CONTEXT CHECKPOINT SUMMARY" }] },
-    { role: "user", content: [{ type: "input_text", text: "Продолжай обычную работу" }] }
-  ] })) {
+  if (isCompactionRequest({
+    input: [
+      { role: "user", content: [{ type: "input_text", text: "Another language model started to solve this problem. CONTEXT CHECKPOINT SUMMARY" }] },
+      { role: "user", content: [{ type: "input_text", text: "Продолжай обычную работу" }] }
+    ]
+  })) {
     throw new Error("historical summary was misclassified as a compaction request");
   }
   const compactCapped = prepareRequest(compactProbe);
@@ -2158,9 +2162,9 @@ function selftest() {
   });
 
   if (mixedInstructions.body.input.some(x =>
-      x && typeof x === "object" &&
-      (String(x.role || "").toLowerCase() === "system" ||
-       String(x.role || "").toLowerCase() === "developer"))) {
+    x && typeof x === "object" &&
+    (String(x.role || "").toLowerCase() === "system" ||
+      String(x.role || "").toLowerCase() === "developer"))) {
     throw new Error("system/developer message remained in Responses history");
   }
   if (mixedInstructions.body.instructions !== "BASE INSTRUCTIONS\n\nMID SYSTEM\n\nDEV RULES") {
@@ -2170,9 +2174,9 @@ function selftest() {
     throw new Error("instruction normalization count failed");
   }
   if (mixedInstructions.body.input.length !== 3 ||
-      mixedInstructions.body.input[0].role !== "user" ||
-      mixedInstructions.body.input[1].role !== "assistant" ||
-      mixedInstructions.body.input[2].role !== "user") {
+    mixedInstructions.body.input[0].role !== "user" ||
+    mixedInstructions.body.input[1].role !== "assistant" ||
+    mixedInstructions.body.input[2].role !== "user") {
     throw new Error("instruction normalization changed ordinary history order");
   }
 
@@ -2192,18 +2196,18 @@ function selftest() {
   }
   const texts = postCompact.input.map(x => messageContentText(x.content));
   if (texts.some(x => x.startsWith("OLD USER A")) ||
-      !texts.includes("canonical/non-user context marker") ||
-      !texts.includes("CURRENT USER REQUEST: fix the collision regression exactly") ||
-      !postCompact.input.some(isCompactionSummaryItem)) {
+    !texts.includes("canonical/non-user context marker") ||
+    !texts.includes("CURRENT USER REQUEST: fix the collision regression exactly") ||
+    !postCompact.input.some(isCompactionSummaryItem)) {
     throw new Error("post-compaction pruning lost current task/canonical context or kept stale user history");
   }
 
   if (compactCapped.body.reasoning?.effort !== COMPACT_REASONING_EFFORT ||
-      (COMPACT_REASONING_BUDGET > 0 && compactCapped.body.thinking_budget_tokens !== COMPACT_REASONING_BUDGET) ||
-      (usesTemplateThinking(compactCapped.body) && compactCapped.body.chat_template_kwargs?.enable_thinking !== false) ||
-      (usesTemplateThinking(compactCapped.body) && compactCapped.body.chat_template_kwargs?.preserve_thinking !== false) ||
-      compactCapped.body.tool_choice !== "none" ||
-      compactCapped.body.parallel_tool_calls !== false) {
+    (COMPACT_REASONING_BUDGET > 0 && compactCapped.body.thinking_budget_tokens !== COMPACT_REASONING_BUDGET) ||
+    (usesTemplateThinking(compactCapped.body) && compactCapped.body.chat_template_kwargs?.enable_thinking !== false) ||
+    (usesTemplateThinking(compactCapped.body) && compactCapped.body.chat_template_kwargs?.preserve_thinking !== false) ||
+    compactCapped.body.tool_choice !== "none" ||
+    compactCapped.body.parallel_tool_calls !== false) {
     throw new Error("compaction non-thinking/serial/no-tools policy failed");
   }
 
