@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.15";
+const VERSION = "1.0.16";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -39,7 +39,9 @@ const UPSTREAM_API_KEY = process.env.LLAMA_API_KEY || "";
 const DEFAULT_MODEL = process.env.CODEX_MODEL || "llm";
 const DEBUG = /^(1|true|yes)$/i.test(process.env.CODEX_PROXY_DEBUG || "");
 const DIAG_PATH = process.env.CODEX_PROXY_DIAG || path.join(__dirname, "proxy.log");
-const POST_COMPACT_OLD_USER_TOKEN_LIMIT = Math.max(0, Number(process.env.CODEX_POST_COMPACT_OLD_USER_TOKEN_LIMIT || "4096") || 0);
+const POST_COMPACT_OLD_USER_TOKEN_LIMIT = Math.max(0, Number(process.env.CODEX_POST_COMPACT_OLD_USER_TOKEN_LIMIT || "0") || 0);
+const POST_COMPACT_TOOL_OUTPUT_MAX_CHARS = Math.max(1000, Number(process.env.CODEX_POST_COMPACT_TOOL_OUTPUT_MAX_CHARS || "4000") || 4000);
+const POST_COMPACT_TOOL_OUTPUT_KEEP_RECENT = Math.max(1, Math.min(8, Number(process.env.CODEX_POST_COMPACT_TOOL_OUTPUT_KEEP_RECENT || "2") || 2));
 const COMPACT_MAX_OUTPUT_TOKENS = Math.max(1024, Number(process.env.CODEX_COMPACT_MAX_OUTPUT_TOKENS || "4096") || 4096);
 const COMPACT_REASONING_EFFORT = String(process.env.CODEX_COMPACT_REASONING_EFFORT || "low").toLowerCase();
 const COMPACT_REASONING_BUDGET = Math.max(0, Number(process.env.CODEX_COMPACT_REASONING_BUDGET || "0") || 0);
@@ -63,6 +65,7 @@ const MEMORY_ENABLED = !/^(0|false|no)$/i.test(process.env.CODEX_MEMORY_ENABLED 
 const MEMORY_BACKEND = String(process.env.CODEX_MEMORY_BACKEND || "json").toLowerCase();
 const CHECKPOINT_BY_KEY = new Map();
 const CHECKPOINT_BY_SUMMARY = new Map();
+const MEMORY_INJECTED_TASKS = new Map();
 let MEMORY_STORE = null;
 
 function log(...a) { console.log("[codex-llama-proxy]", ...a); }
@@ -1026,6 +1029,46 @@ function prunePostCompactionUserHistory(body, oldUserTokenLimit = POST_COMPACT_O
   };
 }
 
+function prunePostCompactionToolOutputs(body, maxChars = POST_COMPACT_TOOL_OUTPUT_MAX_CHARS, keepRecent = POST_COMPACT_TOOL_OUTPUT_KEEP_RECENT) {
+  if (!body || typeof body !== "object" || !Array.isArray(body.input) || !body.input.some(isCompactionSummaryItem)) {
+    return { foundSummary: false, truncated: 0, beforeChars: 0, afterChars: 0 };
+  }
+  const outputs = [];
+  for (let index = 0; index < body.input.length; index++) {
+    const item = body.input[index];
+    if (!item || !["function_call_output", "custom_tool_call_output"].includes(item.type) || typeof item.output !== "string") continue;
+    outputs.push({ index, chars: item.output.length });
+  }
+  const protectedIndexes = new Set(outputs.slice(-keepRecent).map(item => item.index));
+  let truncated = 0;
+  let beforeChars = 0;
+  let afterChars = 0;
+  for (const entry of outputs) {
+    const item = body.input[entry.index];
+    beforeChars += entry.chars;
+    if (!protectedIndexes.has(entry.index) && entry.chars > maxChars) {
+      const digest = crypto.createHash("sha256").update(item.output).digest("hex").slice(0, 16);
+      const marker = `\n...[POST-COMPACTION TOOL OUTPUT TRUNCATED sha256=${digest} original_chars=${entry.chars}]...\n`;
+      const available = Math.max(0, maxChars - marker.length);
+      const head = Math.floor(available * 0.75);
+      item.output = item.output.slice(0, head) + marker + item.output.slice(-(available - head));
+      truncated++;
+    }
+    afterChars += item.output.length;
+  }
+  return { foundSummary: true, truncated, beforeChars, afterChars };
+}
+
+function appendPostCompactContinuationRule(body) {
+  if (!body || typeof body !== "object" || !Array.isArray(body.input) || !body.input.some(isCompactionSummaryItem)) return false;
+  const marker = "POST-COMPACTION CONTINUATION RULE:";
+  const rule = `${marker} The checkpoint is the authoritative task state. Treat every item in WORK COMPLETED as finished and never redo it. Ignore older user requests superseded by CURRENT TASK. Execute exactly NEXT ACTION, using current files and new tool results as truth. Repeat a setup, bridge connection, baseline check, test, edit, commit, or push only when NEXT ACTION explicitly requires it or current evidence proves it invalid.`;
+  const instructions = String(body.instructions || "").trim();
+  if (instructions.includes(marker)) return false;
+  body.instructions = instructions ? `${instructions}\n\n${rule}` : rule;
+  return true;
+}
+
 function normalizeInstructionMessages(body) {
   if (!body || typeof body !== "object" || !Array.isArray(body.input)) {
     return { moved: 0, roles: [] };
@@ -1208,6 +1251,7 @@ function prepareRequest(original) {
     body.instructions = autonomyRule;
   }
   const postCompactPruning = prunePostCompactionUserHistory(body);
+  const postCompactToolPruning = prunePostCompactionToolOutputs(body);
   pruneOrphanProgressMessages(body);
   rewriteTools(body, maps);
   const historyRepairs = rewriteHistoryNode(body.input, maps);
@@ -1230,7 +1274,7 @@ function prepareRequest(original) {
     );
   }
 
-  return { body, maps, instructionNormalization, reasoningNormalization, postCompactPruning, historyRepairs };
+  return { body, maps, instructionNormalization, reasoningNormalization, postCompactPruning, postCompactToolPruning, historyRepairs };
 }
 
 function namespaceInfo(name, maps) {
@@ -1339,9 +1383,19 @@ function memoryTaskInfo(body) {
     if (!text || /^<environment_context>[\s\S]*<\/environment_context>$/i.test(text) ||
       isCompactionInstructionText(text) || COMPACT_SUMMARY_PREFIXES.some(prefix => text.startsWith(prefix)) ||
       text.startsWith("# CONTEXT CHECKPOINT SUMMARY")) continue;
-    return { index, text: memorySanitize(text, 1400) };
+    return { index, id: item.id || item.internal_chat_message_metadata_passthrough?.turn_id || "", text: memorySanitize(text, 1400) };
   }
-  return { index: -1, text: "" };
+  return { index: -1, id: "", text: "" };
+}
+
+function memoryHasRegressionSignal(text) {
+  return /(?:\b(?:again|still|regress(?:ion|ed)?|returned|reappeared|worse|broken|not fixed|doesn['’]?t work)\b|снова|опять|повторн\w*|регресс\w*|вернул\w*|возник\w*|появил\w*|хуже|сломан\w*|не\s+исправ\w*|не\s+работа\w*)/iu.test(String(text || ""));
+}
+
+function rememberMemoryInjection(key) {
+  if (!key) return;
+  MEMORY_INJECTED_TASKS.set(key, Date.now());
+  while (MEMORY_INJECTED_TASKS.size > 512) MEMORY_INJECTED_TASKS.delete(MEMORY_INJECTED_TASKS.keys().next().value);
 }
 
 function memoryProjectFromBody(body) {
@@ -1382,13 +1436,17 @@ function memoryRequestMeta(body) {
       if (evidence.length < 10 && !evidence.includes(line)) evidence.push(line);
     }
   }
-  return { task: task.text, project, evidence, files: [...files].slice(0, 20), hasCommit, hasTest };
+  const taskKey = crypto.createHash("sha256").update(`${project}\n${task.id || task.text}`).digest("hex").slice(0, 20);
+  return { task: task.text, taskKey, project, evidence, files: [...files].slice(0, 20), hasCommit, hasTest };
 }
 
 function memoryInstructionForRequest(body) {
-  if (!MEMORY_ENABLED || isCompactionRequest(body)) return { block: "", meta: memoryRequestMeta(body), count: 0 };
   const meta = memoryRequestMeta(body);
-  if (!meta.task) return { block: "", meta, count: 0 };
+  if (!MEMORY_ENABLED || isCompactionRequest(body) || !meta.task ||
+      (Array.isArray(body?.input) && body.input.some(isCompactionSummaryItem)) ||
+      memoryHasRegressionSignal(meta.task) || MEMORY_INJECTED_TASKS.has(meta.taskKey)) {
+    return { block: "", meta, count: 0 };
+  }
   const store = getMemoryStore();
   if (!store) return { block: "", meta, count: 0 };
   const found = store.search(meta.task, meta.project, MEMORY_MAX_ITEMS);
@@ -1401,6 +1459,7 @@ function memoryInstructionForRequest(body) {
     const evidence = (item.evidence || []).slice(0, 2).join("; ");
     lines.push(`- [${item.id}] Problem: ${memorySanitize(item.problem, 300)} | Successful outcome: ${memorySanitize(item.outcome, 360)}${evidence ? ` | Evidence: ${memorySanitize(evidence, 260)}` : ""}`);
   }
+  rememberMemoryInjection(meta.taskKey);
   return { block: lines.join("\n").slice(0, MEMORY_MAX_CHARS), meta, count: found.length };
 }
 
@@ -1859,6 +1918,7 @@ function createServer() {
             if (checkpoint && appendCheckpointHint(prepared.body, checkpoint)) {
               diag(`POST_COMPACT cold-memory hint=${checkpoint}`);
             }
+            if (appendPostCompactContinuationRule(prepared.body)) diag("POST_COMPACT continuation_rule=1");
           }
 
           if (prepared.instructionNormalization.moved) {
@@ -1876,6 +1936,8 @@ function createServer() {
               `kept_current=${p.keptCurrent} current~=${p.currentTokens} ` +
               `kept_old=${p.keptOld} removed_old=${p.removed}`
             );
+            const t = prepared.postCompactToolPruning;
+            diag(`POST_COMPACT tool_outputs truncated=${t.truncated} before_chars=${t.beforeChars} after_chars=${t.afterChars} keep_recent=${POST_COMPACT_TOOL_OUTPUT_KEEP_RECENT} max_chars=${POST_COMPACT_TOOL_OUTPUT_MAX_CHARS}`);
           }
 
           const beforeTypes = Array.isArray(parsed.input)
