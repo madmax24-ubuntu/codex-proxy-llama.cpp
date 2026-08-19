@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.11";
+const VERSION = "1.0.12";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -377,7 +377,13 @@ function rewriteTools(body, maps) {
     if (!tool || typeof tool !== "object") continue;
 
     if (tool.type === "function") {
-      const f = clone(tool);
+      let f = clone(tool);
+      // Handle OpenAI Chat format where details are nested in tool.function
+      if (f.function && typeof f.function === "object") {
+        const inner = clone(f.function);
+        delete f.function;
+        f = Object.assign(inner, f);
+      }
 
       if (f.name === "shell_command" || f.name === "exec_command") {
         const patchGuide =
