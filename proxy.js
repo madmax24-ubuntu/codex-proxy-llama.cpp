@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.10";
+const VERSION = "1.0.11";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -940,6 +940,12 @@ function prepareRequest(original) {
 
   const reasoningNormalization = normalizeReasoningEffort(body);
   const instructionNormalization = normalizeInstructionMessages(body);
+  const autonomyRule = "AUTONOMOUS EXECUTION PROTOCOL: You must work autonomously until the user's task or multi-step plan is 100% complete. If you just finished a sub-step (e.g. edited a file, applied a patch, or ran a tool), DO NOT stop with an explanation, plan summary, or progress message. You MUST immediately execute the next tool call (e.g. run tests, perform git commit/push, or start the next step) in the very same turn. Only emit a final text message when ALL planned steps are fully implemented, verified, and pushed.";
+  if (typeof body.instructions === "string" && !body.instructions.includes("AUTONOMOUS EXECUTION PROTOCOL:")) {
+    body.instructions = `${body.instructions.trim()}\n\n${autonomyRule}`;
+  } else if (!body.instructions) {
+    body.instructions = autonomyRule;
+  }
   const postCompactPruning = prunePostCompactionUserHistory(body);
   pruneOrphanProgressMessages(body);
   rewriteTools(body, maps);
@@ -2212,7 +2218,7 @@ function selftest() {
       String(x.role || "").toLowerCase() === "developer"))) {
     throw new Error("system/developer message remained in Responses history");
   }
-  if (mixedInstructions.body.instructions !== "BASE INSTRUCTIONS\n\nMID SYSTEM\n\nDEV RULES") {
+  if (!mixedInstructions.body.instructions.startsWith("BASE INSTRUCTIONS\n\nMID SYSTEM\n\nDEV RULES")) {
     throw new Error("system/developer instruction merge failed");
   }
   if (mixedInstructions.instructionNormalization.moved !== 3) {
