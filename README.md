@@ -182,7 +182,7 @@ The installer creates:
 
 ## Episodic memory
 
-The proxy automatically remembers a completed task only when its history contains test or commit evidence. Memories are isolated by workspace, deduplicated, redacted before writing, and reused in later sessions only when their terms overlap the current request. At most three entries and 1200 characters are injected into instructions; the conversation history is not expanded.
+The proxy automatically remembers a completed task only when its history contains test or commit evidence. Memories are isolated by workspace, deduplicated, redacted before writing, and reused in later sessions only when their terms overlap the current request. At most three entries and 1200 characters are injected once per task; memory injection is suppressed after compaction and when the user reports that an earlier result regressed or failed.
 
 By default data is stored atomically in readable `memory/memory.json`, with a second `memory-backup.json` export. Set `CODEX_MEMORY_BACKEND=sqlite` to use the built-in `node:sqlite` backend on a Node.js version that provides it.
 
@@ -207,6 +207,9 @@ node proxy.js --memory-forget MEMORY_ID
 | `CODEX_REASONING_LEVELS` | Comma-separated supported levels | `low,medium,high` |
 | `CODEX_FORCE_SERIAL_TOOL_CALLS` | Force serial tool calls | `1` |
 | `CODEX_COMPACT_MAX_OUTPUT_TOKENS` | Compaction output cap | `4096` |
+| `CODEX_POST_COMPACT_OLD_USER_TOKEN_LIMIT` | Token budget for superseded user requests kept after compaction | `0` |
+| `CODEX_POST_COMPACT_TOOL_OUTPUT_MAX_CHARS` | Maximum retained characters in each older tool output after compaction | `4000` |
+| `CODEX_POST_COMPACT_TOOL_OUTPUT_KEEP_RECENT` | Recent tool outputs kept in full after compaction | `2` |
 | `CODEX_FORWARD_TOOL_PROGRESS` | Forward concise assistant updates before tool calls | `1` |
 | `CODEX_PROGRESS_MAX_CHARS` | Maximum length of a forwarded tool-progress update | `1200` |
 | `CODEX_CHECKPOINT_DIR` | Cold-checkpoint directory | `./checkpoints` |
