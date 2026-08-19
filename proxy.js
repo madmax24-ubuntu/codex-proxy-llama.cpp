@@ -1259,19 +1259,22 @@ function prepareRequest(original) {
   if (Array.isArray(body.input) && body.input.length > 0) {
     const last = body.input[body.input.length - 1];
     const lastRole = last && (last.role || (Array.isArray(last) ? last[0]?.role : null));
-    const isUserOrTool = lastRole === "tool" || lastRole === "function" || lastRole === "user" ||
-      (last && (last.type === "function_call_output" || last.type === "custom_tool_call_output" || last.type === "user" || (last.type === "message" && last.role === "user")));
+    const isUserOrTool = lastRole === "tool" || lastRole === "function" ||
+      (last && (last.type === "function_call_output" || last.type === "custom_tool_call_output"));
     
-    // Also if the conversation ends on assistant message with previous tools, inject an action directive
     const isTerminalWithoutTool = lastRole === "assistant" || (last && last.type === "message" && last.role === "assistant");
 
-    const autonomyReminder = {
-      role: "developer",
-      content: "REMINDER — AUTONOMOUS EXECUTION: Continue execution autonomously until the user's task or multi-step plan is 100% complete. Do NOT stop with an empty message or summary if work remains. IMMEDIATELY call the next required tool (e.g. apply_patch, shell_command, tests, git commit/push). Only send a final text message when ALL requested tasks are completely implemented, verified, and pushed."
-    };
+    const autonomyDirective = "[AUTONOMOUS EXECUTION DIRECTIVE: Continue working autonomously. Do NOT stop with an empty message or progress summary. Immediately execute the next required tool call to complete, verify, and push all tasks.]";
 
-    if (isUserOrTool || isTerminalWithoutTool) {
-      body.input.push(autonomyReminder);
+    if (isUserOrTool && typeof last.output === "string") {
+      last.output = `${last.output.trim()}\n\n${autonomyDirective}`;
+    } else if (isTerminalWithoutTool && typeof last.content === "string") {
+      last.content = `${last.content.trim()}\n\n${autonomyDirective}`;
+    } else if (isTerminalWithoutTool && Array.isArray(last.content) && last.content.length > 0) {
+      const lastPart = last.content[last.content.length - 1];
+      if (lastPart && typeof lastPart.text === "string") {
+        lastPart.text = `${lastPart.text.trim()}\n\n${autonomyDirective}`;
+      }
     }
   }
 
