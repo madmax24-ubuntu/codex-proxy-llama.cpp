@@ -19,6 +19,7 @@ Codex expects more than basic OpenAI-compatible chat completions. Agentic sessio
 - Tool-step chatter suppression without hiding the final assistant answer.
 - Structured compaction that recovers valid checkpoints from reasoning-only llama.cpp responses, suppresses compaction reasoning from the UI, and keeps full cold checkpoints.
 - Fresh-tail recovery metadata instead of silently reusing a stale checkpoint when compaction output is invalid.
+- Persistent project-scoped episodic memory with evidence-gated writes, relevance retrieval, secret redaction, and a bounded prompt footprint.
 - Pre-commit validation instructions for agentic sessions.
 - Exact effective-context calculation from llama.cpp `n_ctx`.
 - Qwen and generic reasoning profiles with configurable budgets.
@@ -177,6 +178,21 @@ The installer creates:
 - `start-proxy.cmd` and `start-proxy.sh`
 - `install-state.json`
 - `checkpoints/`
+- `memory/`
+
+## Episodic memory
+
+The proxy automatically remembers a completed task only when its history contains test or commit evidence. Memories are isolated by workspace, deduplicated, redacted before writing, and reused in later sessions only when their terms overlap the current request. At most three entries and 1200 characters are injected into instructions; the conversation history is not expanded.
+
+Node.js versions with `node:sqlite` store data in `memory/memory.db` and maintain a readable `memory-backup.json`. Older Node.js versions fall back to `memory/memory.json` without extra dependencies.
+
+Inspect or remove entries:
+
+```bash
+node proxy.js --memory-list
+node proxy.js --memory-list /path/to/project
+node proxy.js --memory-forget MEMORY_ID
+```
 
 ## Environment variables
 
@@ -194,6 +210,10 @@ The installer creates:
 | `CODEX_FORWARD_TOOL_PROGRESS` | Forward concise assistant updates before tool calls | `1` |
 | `CODEX_PROGRESS_MAX_CHARS` | Maximum length of a forwarded tool-progress update | `1200` |
 | `CODEX_CHECKPOINT_DIR` | Cold-checkpoint directory | `./checkpoints` |
+| `CODEX_MEMORY_ENABLED` | Enable persistent episodic memory | `1` |
+| `CODEX_MEMORY_DIR` | Episodic-memory directory | `./memory` |
+| `CODEX_MEMORY_MAX_ITEMS` | Maximum retrieved entries per request | `3` |
+| `CODEX_MEMORY_MAX_CHARS` | Maximum injected memory characters | `1200` |
 | `CODEX_PROXY_DIAG` | Diagnostic log path | `./proxy.log` |
 
 See the generated `env.cmd` or `env.sh` for the complete selected profile.

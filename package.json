@@ -1,6 +1,6 @@
 {
   "name": "codex-proxy-llama-cpp",
-  "version": "1.0.14",
+  "version": "1.0.15",
   "private": true,
   "description": "Codex Responses compatibility proxy for llama.cpp",
   "license": "MIT",

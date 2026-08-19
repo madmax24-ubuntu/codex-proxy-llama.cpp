@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "1.0.14"
+VERSION = "1.0.15"
 MARKER = "generated_by_codex_proxy_llama_cpp"
 
 
@@ -282,6 +282,10 @@ def proxy_environment(settings: Settings) -> dict[str, str]:
         "CODEX_PROGRESS_MAX_CHARS": "1200",
         "CODEX_FORCE_SERIAL_TOOL_CALLS": "1",
         "CODEX_CHECKPOINT_DIR": str(settings.codex_home / "checkpoints"),
+        "CODEX_MEMORY_ENABLED": "1",
+        "CODEX_MEMORY_DIR": str(settings.codex_home / "memory"),
+        "CODEX_MEMORY_MAX_ITEMS": "3",
+        "CODEX_MEMORY_MAX_CHARS": "1200",
         "CODEX_PROXY_DIAG": str(settings.codex_home / "proxy.log"),
     }
     return values
@@ -350,6 +354,7 @@ def write_install(settings: Settings, force: bool, dry_run: bool) -> list[Path]:
         return list(files)
     settings.codex_home.mkdir(parents=True, exist_ok=True)
     (settings.codex_home / "checkpoints").mkdir(exist_ok=True)
+    (settings.codex_home / "memory").mkdir(exist_ok=True)
     for path in conflicts:
         backup(path)
     for path, content in files.items():
