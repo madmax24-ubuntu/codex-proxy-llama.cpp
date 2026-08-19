@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.8";
+const VERSION = "1.0.9";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -253,7 +253,7 @@ function applyCompactionPolicy(body, limit = COMPACT_MAX_OUTPUT_TOKENS) {
   body.tool_choice = "none";
   body.parallel_tool_calls = false;
   pruneCompactionInputHistory(body);
-  const contract = "COMPACTION OUTPUT CONTRACT: Return only a dense checkpoint in the configured user language. The first line must be # CONTEXT CHECKPOINT SUMMARY. Use Markdown headings in this exact order: CURRENT TASK, WORK COMPLETED, DECISIONS AND CONSTRAINTS, STATE SNAPSHOT, OPEN ISSUES, PARKED TASKS, NEXT ACTION. Every heading is mandatory; write '- None.' when empty. Preserve concrete state from previous checkpoints. Never emit tool calls, XML-like tool tags, chain-of-thought, or assistant commentary. Target 1200-1800 tokens, start NEXT ACTION before token 2000, and finish it with a complete sentence.";
+  const contract = "COMPACTION OUTPUT CONTRACT: Return only a dense checkpoint in the configured user language. The first line must be # CONTEXT CHECKPOINT SUMMARY. Use Markdown headings in this exact order: CURRENT TASK, WORK COMPLETED, DECISIONS AND CONSTRAINTS, STATE SNAPSHOT, OPEN ISSUES, PARKED TASKS, NEXT ACTION. Every heading is mandatory; write '- None.' when empty. Accurately reflect all completed work under WORK COMPLETED. Never list tasks that are already completed under OPEN ISSUES or NEXT ACTION. In NEXT ACTION, specify ONLY the next uncompleted step. Preserve concrete state from previous checkpoints. Never emit tool calls, XML-like tool tags, chain-of-thought, or assistant commentary. Target 1200-1800 tokens, start NEXT ACTION before token 2000, and finish it with a complete sentence.";
   const instructions = typeof body.instructions === "string" ? body.instructions.trim() : "";
   if (!instructions.includes("COMPACTION OUTPUT CONTRACT:")) {
     body.instructions = instructions ? `${instructions}\n\n${contract}` : contract;
