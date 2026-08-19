@@ -284,6 +284,7 @@ def proxy_environment(settings: Settings) -> dict[str, str]:
         "CODEX_CHECKPOINT_DIR": str(settings.codex_home / "checkpoints"),
         "CODEX_MEMORY_ENABLED": "1",
         "CODEX_MEMORY_DIR": str(settings.codex_home / "memory"),
+        "CODEX_MEMORY_BACKEND": "json",
         "CODEX_MEMORY_MAX_ITEMS": "3",
         "CODEX_MEMORY_MAX_CHARS": "1200",
         "CODEX_PROXY_DIAG": str(settings.codex_home / "proxy.log"),

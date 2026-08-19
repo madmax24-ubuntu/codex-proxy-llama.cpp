@@ -184,7 +184,7 @@ The installer creates:
 
 The proxy automatically remembers a completed task only when its history contains test or commit evidence. Memories are isolated by workspace, deduplicated, redacted before writing, and reused in later sessions only when their terms overlap the current request. At most three entries and 1200 characters are injected into instructions; the conversation history is not expanded.
 
-Node.js versions with `node:sqlite` store data in `memory/memory.db` and maintain a readable `memory-backup.json`. Older Node.js versions fall back to `memory/memory.json` without extra dependencies.
+By default data is stored atomically in readable `memory/memory.json`, with a second `memory-backup.json` export. Set `CODEX_MEMORY_BACKEND=sqlite` to use the built-in `node:sqlite` backend on a Node.js version that provides it.
 
 Inspect or remove entries:
 
@@ -212,6 +212,7 @@ node proxy.js --memory-forget MEMORY_ID
 | `CODEX_CHECKPOINT_DIR` | Cold-checkpoint directory | `./checkpoints` |
 | `CODEX_MEMORY_ENABLED` | Enable persistent episodic memory | `1` |
 | `CODEX_MEMORY_DIR` | Episodic-memory directory | `./memory` |
+| `CODEX_MEMORY_BACKEND` | `json` or optional built-in `sqlite` storage | `json` |
 | `CODEX_MEMORY_MAX_ITEMS` | Maximum retrieved entries per request | `3` |
 | `CODEX_MEMORY_MAX_CHARS` | Maximum injected memory characters | `1200` |
 | `CODEX_PROXY_DIAG` | Diagnostic log path | `./proxy.log` |

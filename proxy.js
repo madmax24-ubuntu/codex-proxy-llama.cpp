@@ -60,6 +60,7 @@ const MEMORY_DIR = process.env.CODEX_MEMORY_DIR || path.join(__dirname, "memory"
 const MEMORY_MAX_ITEMS = Math.max(1, Math.min(8, Number(process.env.CODEX_MEMORY_MAX_ITEMS || "3") || 3));
 const MEMORY_MAX_CHARS = Math.max(400, Math.min(4000, Number(process.env.CODEX_MEMORY_MAX_CHARS || "1200") || 1200));
 const MEMORY_ENABLED = !/^(0|false|no)$/i.test(process.env.CODEX_MEMORY_ENABLED || "1");
+const MEMORY_BACKEND = String(process.env.CODEX_MEMORY_BACKEND || "json").toLowerCase();
 const CHECKPOINT_BY_KEY = new Map();
 const CHECKPOINT_BY_SUMMARY = new Map();
 let MEMORY_STORE = null;
@@ -114,7 +115,7 @@ class MemoryStore {
     this.db = null;
     this.items = [];
     safeMkdir(dir);
-    if (!forceJson && !/^(json)$/i.test(process.env.CODEX_MEMORY_BACKEND || "")) {
+    if (!forceJson && MEMORY_BACKEND === "sqlite") {
       try {
         const { DatabaseSync } = require("node:sqlite");
         this.db = new DatabaseSync(path.join(dir, "memory.db"));

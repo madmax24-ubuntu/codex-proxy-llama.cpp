@@ -131,7 +131,7 @@ llama.cpp n_ctx:      120064
 
 Прокси автоматически сохраняет завершённую задачу только при наличии подтверждения тестом или коммитом. Записи разделены по рабочим каталогам, устраняются дубликаты, а потенциальные ключи и пароли скрываются до записи. В новую задачу подмешиваются только похожие записи: не более трёх и суммарно не более 1200 символов. История чата при этом не разрастается.
 
-На Node.js с `node:sqlite` данные находятся в `memory/memory.db`, рядом создаётся читаемый `memory-backup.json`. На старых версиях Node.js автоматически используется `memory/memory.json`.
+По умолчанию данные атомарно записываются в читаемый `memory/memory.json`, рядом создаётся экспорт `memory-backup.json`. Для встроенной SQLite можно задать `CODEX_MEMORY_BACKEND=sqlite`, если установленная версия Node.js предоставляет `node:sqlite`.
 
 Просмотр и удаление записей:
 
@@ -141,7 +141,7 @@ node proxy.js --memory-list C:\\path\\to\\project
 node proxy.js --memory-forget ID_ЗАПИСИ
 ```
 
-Настройки: `CODEX_MEMORY_ENABLED`, `CODEX_MEMORY_DIR`, `CODEX_MEMORY_MAX_ITEMS` и `CODEX_MEMORY_MAX_CHARS`.
+Настройки: `CODEX_MEMORY_ENABLED`, `CODEX_MEMORY_DIR`, `CODEX_MEMORY_BACKEND`, `CODEX_MEMORY_MAX_ITEMS` и `CODEX_MEMORY_MAX_CHARS`.
 
 ## Безопасность
 
