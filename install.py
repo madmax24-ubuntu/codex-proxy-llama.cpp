@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "1.0.12"
+VERSION = "1.0.13"
 MARKER = "generated_by_codex_proxy_llama_cpp"
 
 

@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.12";
+const VERSION = "1.0.13";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -956,6 +956,18 @@ function prepareRequest(original) {
   pruneOrphanProgressMessages(body);
   rewriteTools(body, maps);
   const historyRepairs = rewriteHistoryNode(body.input, maps);
+
+  if (Array.isArray(body.input)) {
+    const last = body.input[body.input.length - 1];
+    const lastRole = last && (last.role || (Array.isArray(last) ? last[0]?.role : null));
+    const autonomyReminder = {
+      role: "developer",
+      content: "REMINDER — AUTONOMOUS EXECUTION: You are mid-task. Do NOT stop or write a summary. IMMEDIATELY call the next required tool (run tests, git commit, git push, or next implementation step). Only send a final text message when ALL steps are 100% done and pushed."
+    };
+    if (lastRole === "tool" || lastRole === "function" || (last && last.type === "function_call_output") || (last && last.type === "custom_tool_call_output")) {
+      body.input.push(autonomyReminder);
+    }
+  }
 
   if (Array.isArray(body.include)) {
     body.include = body.include.filter(x =>
