@@ -84,7 +84,7 @@ function memorySanitize(value, limit = 1600) {
     .replace(/-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----/gi, "[REDACTED PRIVATE KEY]")
     .replace(/\b(?:ghp_|github_pat_|sk-|xox[baprs]-)[A-Za-z0-9_.-]{12,}\b/g, "[REDACTED TOKEN]")
     .replace(/\b(authorization|api[_-]?key|access[_-]?token|password|passwd|secret)\s*[:=]\s*([^\s,;]+)/gi, "$1=[REDACTED]")
-    .replace(/(?:https?:\/\/)([^\s:@/]+):([^\s@/]+)@/gi, "$1[REDACTED]@")
+    .replace(/(https?:\/\/)([^\s:@/]+):([^\s@/]+)@/gi, "$1$2:[REDACTED]@")
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, limit);
@@ -2702,7 +2702,7 @@ function selftest() {
   }
 
   const memoryTemp = fs.mkdtempSync(path.join(require("os").tmpdir(), "codex-memory-selftest-"));
-  const memoryStore = new MemoryStore(memoryTemp, true);
+  let memoryStore = new MemoryStore(memoryTemp, true);
   try {
     memoryStore.upsert({
       id: "memory-selftest",
@@ -2714,8 +2714,20 @@ function selftest() {
       keywords: memoryTokens("BotBrain syntax error optimization missing brace JavaScript"),
       confidence: 1
     });
+    memoryStore.close();
+    memoryStore = new MemoryStore(memoryTemp, true);
     const recalled = memoryStore.search("Fix another BotBrain JavaScript syntax error", "C:/work/rublox", 3);
     if (recalled.length !== 1 || recalled[0].id !== "memory-selftest") throw new Error("episodic memory retrieval failed");
+    const priorMemoryStore = MEMORY_STORE;
+    MEMORY_STORE = memoryStore;
+    const recalledRequest = memoryInstructionForRequest({
+      instructions: "<environment_context><cwd>C:/work/rublox</cwd></environment_context>",
+      input: [{ role: "user", content: [{ type: "input_text", text: "Fix another BotBrain JavaScript syntax error" }] }]
+    });
+    MEMORY_STORE = priorMemoryStore;
+    if (recalledRequest.count !== 1 || !recalledRequest.block.includes("memory-selftest") || recalledRequest.block.length > MEMORY_MAX_CHARS) {
+      throw new Error("episodic memory cross-session injection failed");
+    }
     const memoryMeta = memoryRequestMeta({ input: [
       { role: "user", content: [{ type: "input_text", text: "Fix BotBrain syntax" }] },
       { type: "custom_tool_call", name: "apply_patch", input: "*** Begin Patch\n*** Update File: entities/BotBrain.js\n*** End Patch" },
@@ -2724,7 +2736,7 @@ function selftest() {
     if (!memoryMeta.hasTest || !memoryMeta.hasCommit || memoryMeta.files[0] !== "entities/BotBrain.js") {
       throw new Error("episodic memory evidence extraction failed");
     }
-    if (!memorySanitize("api_key=super-secret-value").includes("[REDACTED]")) throw new Error("episodic memory secret redaction failed");
+    if (!memorySanitize("api_key=super-secret-value https://user:pass@example.com").includes("https://user:[REDACTED]@example.com")) throw new Error("episodic memory secret redaction failed");
     if (!memoryStore.forget("memory-selftest") || memoryStore.all().length) throw new Error("episodic memory deletion failed");
   } finally {
     memoryStore.close();
