@@ -56,8 +56,13 @@ const SUPPORTED_REASONING_LEVELS = new Set(String(process.env.CODEX_REASONING_LE
 const THINKING_MODE = String(process.env.CODEX_THINKING_MODE || "auto").toLowerCase();
 const FORCE_SERIAL_TOOL_CALLS = !/^(0|false|no)$/i.test(process.env.CODEX_FORCE_SERIAL_TOOL_CALLS || "1");
 const CHECKPOINT_DIR = process.env.CODEX_CHECKPOINT_DIR || path.join(__dirname, "checkpoints");
+const MEMORY_DIR = process.env.CODEX_MEMORY_DIR || path.join(__dirname, "memory");
+const MEMORY_MAX_ITEMS = Math.max(1, Math.min(8, Number(process.env.CODEX_MEMORY_MAX_ITEMS || "3") || 3));
+const MEMORY_MAX_CHARS = Math.max(400, Math.min(4000, Number(process.env.CODEX_MEMORY_MAX_CHARS || "1200") || 1200));
+const MEMORY_ENABLED = !/^(0|false|no)$/i.test(process.env.CODEX_MEMORY_ENABLED || "1");
 const CHECKPOINT_BY_KEY = new Map();
 const CHECKPOINT_BY_SUMMARY = new Map();
+let MEMORY_STORE = null;
 
 function log(...a) { console.log("[codex-llama-proxy]", ...a); }
 function debug(...a) { if (DEBUG) console.log("[codex-llama-proxy:debug]", ...a); }
@@ -67,6 +72,183 @@ function clone(x) { return JSON.parse(JSON.stringify(x)); }
 function safeMkdir(dir) {
   try { fs.mkdirSync(dir, { recursive: true }); return true; }
   catch { return false; }
+}
+
+const MEMORY_STOP_WORDS = new Set([
+  "this", "that", "with", "from", "have", "will", "your", "into", "after", "before", "then", "when", "what",
+  "для", "что", "как", "это", "или", "после", "перед", "нужно", "надо", "будет", "были", "есть", "при", "его", "она"
+]);
+
+function memorySanitize(value, limit = 1600) {
+  return String(value || "")
+    .replace(/-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----/gi, "[REDACTED PRIVATE KEY]")
+    .replace(/\b(?:ghp_|github_pat_|sk-|xox[baprs]-)[A-Za-z0-9_.-]{12,}\b/g, "[REDACTED TOKEN]")
+    .replace(/\b(authorization|api[_-]?key|access[_-]?token|password|passwd|secret)\s*[:=]\s*([^\s,;]+)/gi, "$1=[REDACTED]")
+    .replace(/(?:https?:\/\/)([^\s:@/]+):([^\s@/]+)@/gi, "$1[REDACTED]@")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, limit);
+}
+
+function memoryTokens(value) {
+  const matches = memorySanitize(value, 12000).toLowerCase().match(/[\p{L}\p{N}_.\/-]{3,}/gu) || [];
+  const out = new Set();
+  for (const token of matches) {
+    if (MEMORY_STOP_WORDS.has(token)) continue;
+    out.add(token);
+    for (const part of token.split(/[_.\/-]+/)) if (part.length >= 3 && !MEMORY_STOP_WORDS.has(part)) out.add(part);
+  }
+  return [...out].slice(0, 160);
+}
+
+function memoryProject(value) {
+  const clean = String(value || "global").trim().replace(/[\\/]+$/, "").replace(/\\/g, "/");
+  return /^[a-z]:\//i.test(clean) ? clean.toLowerCase() : clean || "global";
+}
+
+class MemoryStore {
+  constructor(dir, forceJson = false) {
+    this.dir = dir;
+    this.jsonPath = path.join(dir, "memory.json");
+    this.exportPath = path.join(dir, "memory-backup.json");
+    this.db = null;
+    this.items = [];
+    safeMkdir(dir);
+    if (!forceJson && !/^(json)$/i.test(process.env.CODEX_MEMORY_BACKEND || "")) {
+      try {
+        const { DatabaseSync } = require("node:sqlite");
+        this.db = new DatabaseSync(path.join(dir, "memory.db"));
+        this.db.exec("CREATE TABLE IF NOT EXISTS memories (id TEXT PRIMARY KEY, project TEXT NOT NULL, problem TEXT NOT NULL, outcome TEXT NOT NULL, evidence TEXT NOT NULL, files TEXT NOT NULL, key_terms TEXT NOT NULL, confidence REAL NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_used_at TEXT, use_count INTEGER NOT NULL DEFAULT 0)");
+      } catch (err) {
+        diag(`MEMORY sqlite unavailable fallback=json error=${err.message}`);
+      }
+    }
+    if (!this.db) this.loadJson();
+  }
+
+  loadJson() {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(this.jsonPath, "utf8"));
+      this.items = Array.isArray(parsed) ? parsed : [];
+    } catch {
+      this.items = [];
+    }
+  }
+
+  all(limit = 1000) {
+    if (this.db) {
+      return this.db.prepare("SELECT * FROM memories ORDER BY updated_at DESC LIMIT ?").all(Math.max(1, limit)).map(row => ({
+        ...row,
+        evidence: JSON.parse(row.evidence || "[]"),
+        files: JSON.parse(row.files || "[]"),
+        keywords: JSON.parse(row.key_terms || "[]")
+      }));
+    }
+    return this.items.slice().sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at))).slice(0, limit);
+  }
+
+  persistJson() {
+    const temp = `${this.jsonPath}.${process.pid}.tmp`;
+    fs.writeFileSync(temp, JSON.stringify(this.items, null, 2), "utf8");
+    fs.renameSync(temp, this.jsonPath);
+  }
+
+  exportJson() {
+    const temp = `${this.exportPath}.${process.pid}.tmp`;
+    fs.writeFileSync(temp, JSON.stringify(this.all(2000), null, 2), "utf8");
+    fs.renameSync(temp, this.exportPath);
+  }
+
+  upsert(record) {
+    const now = new Date().toISOString();
+    const item = {
+      ...record,
+      project: memoryProject(record.project),
+      created_at: record.created_at || now,
+      updated_at: now,
+      last_used_at: record.last_used_at || null,
+      use_count: Number(record.use_count || 0)
+    };
+    if (this.db) {
+      const existing = this.db.prepare("SELECT created_at, use_count, last_used_at FROM memories WHERE id = ?").get(item.id);
+      if (existing) {
+        item.created_at = existing.created_at;
+        item.use_count = Number(existing.use_count || 0);
+        item.last_used_at = existing.last_used_at || null;
+      }
+      this.db.prepare("INSERT INTO memories (id, project, problem, outcome, evidence, files, key_terms, confidence, created_at, updated_at, last_used_at, use_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET project=excluded.project, problem=excluded.problem, outcome=excluded.outcome, evidence=excluded.evidence, files=excluded.files, key_terms=excluded.key_terms, confidence=excluded.confidence, updated_at=excluded.updated_at").run(
+        item.id, item.project, item.problem, item.outcome, JSON.stringify(item.evidence || []), JSON.stringify(item.files || []), JSON.stringify(item.keywords || []), Number(item.confidence || 0.8), item.created_at, item.updated_at, item.last_used_at, item.use_count
+      );
+    } else {
+      const index = this.items.findIndex(value => value.id === item.id);
+      if (index >= 0) item.created_at = this.items[index].created_at || item.created_at;
+      if (index >= 0) this.items[index] = { ...this.items[index], ...item };
+      else this.items.push(item);
+      this.items = this.items.sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at))).slice(0, 2000);
+      this.persistJson();
+    }
+    this.exportJson();
+    return item;
+  }
+
+  markUsed(ids) {
+    if (!ids.length) return;
+    const now = new Date().toISOString();
+    if (this.db) {
+      const stmt = this.db.prepare("UPDATE memories SET last_used_at = ?, use_count = use_count + 1 WHERE id = ?");
+      for (const id of ids) stmt.run(now, id);
+    } else {
+      for (const item of this.items) if (ids.includes(item.id)) {
+        item.last_used_at = now;
+        item.use_count = Number(item.use_count || 0) + 1;
+      }
+      this.persistJson();
+    }
+  }
+
+  forget(id) {
+    let changed = false;
+    if (this.db) changed = Number(this.db.prepare("DELETE FROM memories WHERE id = ?").run(id).changes || 0) > 0;
+    else {
+      const before = this.items.length;
+      this.items = this.items.filter(item => item.id !== id);
+      changed = this.items.length !== before;
+      if (changed) this.persistJson();
+    }
+    if (changed) this.exportJson();
+    return changed;
+  }
+
+  search(query, project, limit = MEMORY_MAX_ITEMS) {
+    const queryTokens = new Set(memoryTokens(query));
+    const normalizedProject = memoryProject(project);
+    if (!queryTokens.size) return [];
+    const ranked = [];
+    for (const item of this.all(1000)) {
+      const itemProject = memoryProject(item.project);
+      if (itemProject !== "global" && normalizedProject !== "global" && itemProject !== normalizedProject) continue;
+      const terms = new Set(Array.isArray(item.keywords) ? item.keywords : memoryTokens(`${item.problem} ${item.outcome} ${(item.files || []).join(" ")}`));
+      let overlap = 0;
+      for (const token of queryTokens) if (terms.has(token)) overlap++;
+      if (!overlap) continue;
+      const projectScore = itemProject === normalizedProject ? 4 : 0.5;
+      const score = overlap * 2 + projectScore + Math.min(1, Number(item.use_count || 0) / 10) + Number(item.confidence || 0);
+      ranked.push({ ...item, score });
+    }
+    const found = ranked.sort((a, b) => b.score - a.score || String(b.updated_at).localeCompare(String(a.updated_at))).slice(0, limit);
+    this.markUsed(found.map(item => item.id));
+    return found;
+  }
+
+  close() {
+    if (this.db) this.db.close();
+  }
+}
+
+function getMemoryStore() {
+  if (!MEMORY_ENABLED) return null;
+  if (!MEMORY_STORE) MEMORY_STORE = new MemoryStore(MEMORY_DIR);
+  return MEMORY_STORE;
 }
 
 function checkpointName(kind) {
@@ -1140,6 +1322,107 @@ function bufferedMessageEventId(encoded) {
   }
 }
 
+function memoryOutputText(item) {
+  if (!item || typeof item !== "object") return "";
+  if (typeof item.output === "string") return item.output;
+  if (Array.isArray(item.output)) return item.output.map(block => typeof block === "string" ? block : (block?.text || block?.content || "")).join("\n");
+  return "";
+}
+
+function memoryTaskInfo(body) {
+  const items = Array.isArray(body?.input) ? body.input : [];
+  for (let index = items.length - 1; index >= 0; index--) {
+    const item = items[index];
+    if (!isUserMessageItem(item)) continue;
+    const text = messageContentText(item.content).trim();
+    if (!text || /^<environment_context>[\s\S]*<\/environment_context>$/i.test(text) ||
+      isCompactionInstructionText(text) || COMPACT_SUMMARY_PREFIXES.some(prefix => text.startsWith(prefix)) ||
+      text.startsWith("# CONTEXT CHECKPOINT SUMMARY")) continue;
+    return { index, text: memorySanitize(text, 1400) };
+  }
+  return { index: -1, text: "" };
+}
+
+function memoryProjectFromBody(body) {
+  const items = Array.isArray(body?.input) ? body.input : [];
+  const source = [body?.instructions || "", ...items.map(item => messageContentText(item?.content))].join("\n");
+  const matches = [...source.matchAll(/<cwd>([^<]+)<\/cwd>/gi)];
+  if (matches.length) return memoryProject(matches[matches.length - 1][1]);
+  const roots = [...source.matchAll(/<workspace_roots>[\s\S]*?<root>([^<]+)<\/root>[\s\S]*?<\/workspace_roots>/gi)];
+  if (roots.length) return memoryProject(roots[roots.length - 1][1]);
+  return "global";
+}
+
+function memoryRequestMeta(body) {
+  const task = memoryTaskInfo(body);
+  const project = memoryProjectFromBody(body);
+  const items = Array.isArray(body?.input) ? body.input.slice(Math.max(0, task.index + 1)) : [];
+  const evidence = [];
+  const files = new Set();
+  let hasCommit = false;
+  let hasTest = false;
+  for (const item of items) {
+    if (!item || typeof item !== "object") continue;
+    if ((item.type === "custom_tool_call" || item.type === "function_call") && item.name === "apply_patch") {
+      const patchText = String(item.input || item.arguments || "");
+      for (const match of patchText.matchAll(/\*\*\* (?:Update|Add|Delete) File:\s*([^\r\n]+)/g)) files.add(memorySanitize(match[1], 260));
+    }
+    const output = memoryOutputText(item);
+    if (!output) continue;
+    for (const match of output.matchAll(/diff --git a\/([^\s]+) b\/([^\s]+)/g)) files.add(memorySanitize(match[2], 260));
+    for (const rawLine of output.split(/\r?\n/)) {
+      const line = memorySanitize(rawLine, 420);
+      if (!line) continue;
+      const commit = /^\[[^\]]+\s+[0-9a-f]{7,40}\]/i.test(line) || /[0-9a-f]{7,40}\.\.[0-9a-f]{7,40}\s+\S+\s+->\s+\S+/i.test(line);
+      const test = /\bSELFTEST PASS\b|\bNODE_CHECK[^\r\n]*PASS\b|\bPASS:\s|\btests?\b[^\r\n]{0,60}\b(?:passed|pass|ok)\b|^Ran \d+ tests?\b|^OK$/i.test(line);
+      if (!commit && !test) continue;
+      if (commit) hasCommit = true;
+      if (test) hasTest = true;
+      if (evidence.length < 10 && !evidence.includes(line)) evidence.push(line);
+    }
+  }
+  return { task: task.text, project, evidence, files: [...files].slice(0, 20), hasCommit, hasTest };
+}
+
+function memoryInstructionForRequest(body) {
+  if (!MEMORY_ENABLED || isCompactionRequest(body)) return { block: "", meta: memoryRequestMeta(body), count: 0 };
+  const meta = memoryRequestMeta(body);
+  if (!meta.task) return { block: "", meta, count: 0 };
+  const store = getMemoryStore();
+  if (!store) return { block: "", meta, count: 0 };
+  const found = store.search(meta.task, meta.project, MEMORY_MAX_ITEMS);
+  if (!found.length) return { block: "", meta, count: 0 };
+  const lines = [
+    "LOCAL EPISODIC MEMORY (automatically retrieved; historical evidence, not current truth):",
+    "Use only entries relevant to the current task. Current files, tool results, and user instructions always take priority. Do not repeat memory to the user unless it affects the work."
+  ];
+  for (const item of found) {
+    const evidence = (item.evidence || []).slice(0, 2).join("; ");
+    lines.push(`- [${item.id}] Problem: ${memorySanitize(item.problem, 300)} | Successful outcome: ${memorySanitize(item.outcome, 360)}${evidence ? ` | Evidence: ${memorySanitize(evidence, 260)}` : ""}`);
+  }
+  return { block: lines.join("\n").slice(0, MEMORY_MAX_CHARS), meta, count: found.length };
+}
+
+function rememberCompletedTask(meta, responseText) {
+  if (!MEMORY_ENABLED || !meta?.task || (!meta.hasCommit && !meta.hasTest)) return null;
+  const outcome = memorySanitize(responseText, 1400);
+  if (outcome.length < 20 || looksLikeProgressOnly(outcome)) return null;
+  const key = `${memoryProject(meta.project)}\n${meta.task.toLowerCase().replace(/\s+/g, " ")}`;
+  const id = crypto.createHash("sha256").update(key).digest("hex").slice(0, 16);
+  const record = {
+    id,
+    project: meta.project,
+    problem: memorySanitize(meta.task, 900),
+    outcome,
+    evidence: meta.evidence.map(value => memorySanitize(value, 420)),
+    files: meta.files.map(value => memorySanitize(value, 260)),
+    keywords: memoryTokens(`${meta.task} ${outcome} ${meta.files.join(" ")}`),
+    confidence: meta.hasCommit && meta.hasTest ? 1 : 0.9
+  };
+  const saved = getMemoryStore()?.upsert(record) || null;
+  if (saved) diag(`MEMORY saved id=${saved.id} project=${JSON.stringify(saved.project)} evidence=${saved.evidence.length} files=${saved.files.length}`);
+  return saved;
+}
 function suppressMessagesWithToolCalls(obj, keepMessageIds = new Set()) {
   if (!obj || typeof obj !== "object" || !Array.isArray(obj.output)) return 0;
   const hasToolCall = obj.output.some(x => x && (x.type === "function_call" || x.type === "custom_tool_call"));
@@ -1489,6 +1772,9 @@ class SseTranslator {
       } else if (!this.sawToolCall && looksLikeProgressOnly(this.text)) {
         diag(`TURN_GUARD WARNING progress-only terminal assistant message=${JSON.stringify(this.text.slice(0, 500))}`);
       }
+      if (!this.requestMeta.isCompaction && !this.sawToolCall) {
+        rememberCompletedTask(this.requestMeta.memoryTask, this.text || responseTextFromObject(evt.response));
+      }
       return [...buffered, this.event(evt)];
     } else if (evt.type === "response.failed" || evt.type === "error" || evt.type === "response.incomplete") {
       const kind = this.requestMeta.isCompaction ? "COMPACTION failed" : "response failed";
@@ -1534,7 +1820,7 @@ function createServer() {
           req.method === "POST" &&
           (req.url === "/v1/responses" || req.url === "/responses");
 
-        let requestMeta = { isCompaction: false, requestBytes: decoded.length, cacheKey: "default", checkpointPath: null, fingerprint: "" };
+        let requestMeta = { isCompaction: false, requestBytes: decoded.length, cacheKey: "default", checkpointPath: null, fingerprint: "", memoryTask: null };
 
         if (isResponses && decoded.length) {
           const parsed = JSON.parse(decoded.toString("utf8"));
@@ -1550,7 +1836,13 @@ function createServer() {
             }
           }
 
+          const memory = memoryInstructionForRequest(parsed);
+          requestMeta.memoryTask = memory.meta;
           const prepared = prepareRequest(parsed);
+          if (memory.block) {
+            prepared.body.instructions = `${String(prepared.body.instructions || "").trim()}\n\n${memory.block}`.trim();
+            diag(`MEMORY injected count=${memory.count} chars=${memory.block.length} project=${JSON.stringify(memory.meta.project)}`);
+          }
           maps = prepared.maps;
 
           if (prepared.historyRepairs.length) {
@@ -1748,6 +2040,10 @@ function createServer() {
                     updateCheckpointSummary(requestMeta.checkpointPath, responseText, usage);
                   } else if (looksLikeProgressOnly(responseText)) {
                     diag(`TURN_GUARD WARNING progress-only terminal assistant message=${JSON.stringify(responseText.slice(0, 500))}`);
+                  }
+                  const nonstreamOutput = obj?.response?.output || obj?.output || [];
+                  if (!requestMeta.isCompaction && !nonstreamOutput.some(item => item?.type === "function_call" || item?.type === "custom_tool_call")) {
+                    rememberCompletedTask(requestMeta.memoryTask, responseText);
                   }
                 }
                 output = Buffer.from(JSON.stringify(obj));
@@ -2405,11 +2701,62 @@ function selftest() {
     throw new Error("progress-only terminal detector failed");
   }
 
+  const memoryTemp = fs.mkdtempSync(path.join(require("os").tmpdir(), "codex-memory-selftest-"));
+  const memoryStore = new MemoryStore(memoryTemp, true);
+  try {
+    memoryStore.upsert({
+      id: "memory-selftest",
+      project: "C:/work/rublox",
+      problem: "BotBrain syntax error after optimization",
+      outcome: "Restored the missing class brace and verified all JavaScript files",
+      evidence: ["NODE_CHECK_ALL_TRACKED_JS=PASS"],
+      files: ["entities/BotBrain.js"],
+      keywords: memoryTokens("BotBrain syntax error optimization missing brace JavaScript"),
+      confidence: 1
+    });
+    const recalled = memoryStore.search("Fix another BotBrain JavaScript syntax error", "C:/work/rublox", 3);
+    if (recalled.length !== 1 || recalled[0].id !== "memory-selftest") throw new Error("episodic memory retrieval failed");
+    const memoryMeta = memoryRequestMeta({ input: [
+      { role: "user", content: [{ type: "input_text", text: "Fix BotBrain syntax" }] },
+      { type: "custom_tool_call", name: "apply_patch", input: "*** Begin Patch\n*** Update File: entities/BotBrain.js\n*** End Patch" },
+      { type: "function_call_output", output: "NODE_CHECK_ALL_TRACKED_JS=PASS\n[main abc1234] fix syntax" }
+    ] });
+    if (!memoryMeta.hasTest || !memoryMeta.hasCommit || memoryMeta.files[0] !== "entities/BotBrain.js") {
+      throw new Error("episodic memory evidence extraction failed");
+    }
+    if (!memorySanitize("api_key=super-secret-value").includes("[REDACTED]")) throw new Error("episodic memory secret redaction failed");
+    if (!memoryStore.forget("memory-selftest") || memoryStore.all().length) throw new Error("episodic memory deletion failed");
+  } finally {
+    memoryStore.close();
+    fs.rmSync(memoryTemp, { recursive: true, force: true });
+  }
+
   console.log(`SELFTEST PASS ${VERSION}`);
+}
+
+function runMemoryCli() {
+  const listIndex = process.argv.indexOf("--memory-list");
+  const forgetIndex = process.argv.indexOf("--memory-forget");
+  if (listIndex < 0 && forgetIndex < 0) return false;
+  const store = getMemoryStore();
+  if (!store) throw new Error("episodic memory is disabled");
+  if (forgetIndex >= 0) {
+    const id = process.argv[forgetIndex + 1];
+    if (!id) throw new Error("--memory-forget requires an id");
+    console.log(store.forget(id) ? `FORGOT ${id}` : `NOT FOUND ${id}`);
+    return true;
+  }
+  const projectArg = process.argv[listIndex + 1];
+  const project = projectArg && !projectArg.startsWith("--") ? memoryProject(projectArg) : "";
+  const items = store.all(2000).filter(item => !project || memoryProject(item.project) === project);
+  console.log(JSON.stringify(items, null, 2));
+  return true;
 }
 
 if (process.argv.includes("--selftest")) {
   selftest();
+} else if (runMemoryCli()) {
+  process.exitCode = 0;
 } else {
   restoreCheckpointIndex();
   const server = createServer();
