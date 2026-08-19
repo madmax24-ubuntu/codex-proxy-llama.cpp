@@ -34,6 +34,8 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(model["apply_patch_tool_type"], "freeform")
         self.assertEqual(model["effective_context_window_percent"], 95)
         self.assertEqual(model["supported_reasoning_levels"][-1]["effort"], "xhigh")
+        self.assertIn("Before every commit or push", model["base_instructions"])
+        self.assertIn("dedicated apply_patch tool", model["base_instructions"])
 
     def test_install_and_backup(self):
         with tempfile.TemporaryDirectory() as temp:

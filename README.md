@@ -17,7 +17,9 @@ Codex expects more than basic OpenAI-compatible chat completions. Agentic sessio
 - Function/custom tool history replay across turns.
 - Correct SSE event framing, completion usage normalization, abort propagation, and broken-stream diagnostics.
 - Tool-step chatter suppression without hiding the final assistant answer.
-- Fast structured compaction with full cold checkpoints.
+- Structured compaction that recovers valid checkpoints from reasoning-only llama.cpp responses, suppresses compaction reasoning from the UI, and keeps full cold checkpoints.
+- Fresh-tail recovery metadata instead of silently reusing a stale checkpoint when compaction output is invalid.
+- Pre-commit validation instructions for agentic sessions.
 - Exact effective-context calculation from llama.cpp `n_ctx`.
 - Qwen and generic reasoning profiles with configurable budgets.
 - Interactive and fully non-interactive Python installer.

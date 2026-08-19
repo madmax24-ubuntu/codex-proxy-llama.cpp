@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.13";
+const VERSION = "1.0.14";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -310,6 +310,46 @@ function responseTextFromObject(obj) {
   };
   walk(obj?.output ?? obj);
   return chunks.join("");
+}
+
+function reasoningTextFromObject(obj) {
+  const chunks = [];
+  const walk = value => {
+    if (Array.isArray(value)) {
+      for (const item of value) walk(item);
+      return;
+    }
+    if (!value || typeof value !== "object") return;
+    if ((value.type === "reasoning_text" || value.type === "reasoning_summary_text") && typeof value.text === "string") {
+      chunks.push(value.text);
+    }
+    for (const [key, nested] of Object.entries(value)) {
+      if (key !== "text") walk(nested);
+    }
+  };
+  walk(obj?.output ?? obj);
+  return chunks.join("");
+}
+
+function isReasoningStreamEvent(evt) {
+  return !!evt && evt.type !== "response.completed" && (
+    evt.type?.startsWith("response.reasoning") ||
+    evt.item?.type === "reasoning" ||
+    evt.part?.type === "reasoning_text" ||
+    evt.part?.type === "reasoning_summary_text"
+  );
+}
+
+function replaceResponseText(obj, text) {
+  const response = obj?.response && typeof obj.response === "object" ? obj.response : obj;
+  if (!response || typeof response !== "object") return;
+  response.output = [{
+    id: `msg_compaction_recovery_${Date.now()}`,
+    type: "message",
+    role: "assistant",
+    status: "completed",
+    content: [{ type: "output_text", text, annotations: [] }]
+  }];
 }
 
 function looksLikeProgressOnly(text) {
@@ -618,6 +658,20 @@ function isValidCompactionText(text) {
     COMPACTION_REQUIRED_HEADINGS.every(heading => metrics.sections.has(heading));
 }
 
+function compactionCandidateText(text) {
+  const value = String(text || "").trim();
+  return checkpointSummaryText(value) || value;
+}
+
+function bestCompactionCandidate(...values) {
+  return values.map(compactionCandidateText).filter(Boolean).sort((left, right) => {
+    const a = compactionTextMetrics(left);
+    const b = compactionTextMetrics(right);
+    return Number(isValidCompactionText(right)) - Number(isValidCompactionText(left)) ||
+      b.present - a.present || right.length - left.length;
+  })[0] || "";
+}
+
 function repairCompactionText(text, recovery = "", outputLimitHit = false) {
   const generated = compactionTextMetrics(text);
   const previous = compactionTextMetrics(recovery);
@@ -652,20 +706,36 @@ function cleanRecoveryText(text, limit = 4000) {
 
 function buildCompactionRecoverySummary(body) {
   const items = Array.isArray(body?.input) ? body.input : [];
+  let previous = "";
   for (let i = items.length - 1; i >= 0; i--) {
     const text = messageContentText(items[i]?.content);
     const match = text.match(/^#{0,6}\s*CONTEXT CHECKPOINT SUMMARY\b/m);
     if (!match) continue;
     const prior = text.slice(match.index).trim();
-    if (isValidCompactionText(prior)) return prior;
     const repaired = repairCompactionText(prior);
-    if (isValidCompactionText(repaired)) return repaired;
+    if (isValidCompactionText(repaired)) {
+      previous = repaired;
+      break;
+    }
   }
   const users = Array.isArray(body?.input)
     ? body.input.filter(isUserMessageItem).map(item => messageContentText(item.content).trim()).filter(Boolean)
     : [];
   const latest = [...users].reverse().find(text => !isCompactionInstructionText(text) && !COMPACT_SUMMARY_PREFIXES.some(prefix => text.startsWith(prefix)));
-  const task = cleanRecoveryText(latest) || "Продолжить последний активный запрос пользователя, сверившись с рабочей директорией и сохранённым transcript.";
+  const old = compactionTextMetrics(previous);
+  const task = cleanRecoveryText(latest) || old.sections.get("CURRENT TASK") || "Продолжить последний активный запрос пользователя, сверившись с рабочей директорией и сохранённым transcript.";
+  const recent = items.slice(-24).map(item => {
+    if (!item || typeof item !== "object" || item.type === "reasoning") return "";
+    if (item.type === "function_call") return `Вызван ${item.name || "tool"}: ${cleanRecoveryText(item.arguments, 500)}`;
+    if (item.type === "function_call_output" || item.type === "custom_tool_call_output") {
+      const value = typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? "");
+      return `Результат инструмента: ${cleanRecoveryText(value, 500)}`;
+    }
+    const text = messageContentText(item.content);
+    if (!text || isCompactionInstructionText(text) || COMPACT_SUMMARY_PREFIXES.some(prefix => text.trimStart().startsWith(prefix))) return "";
+    return `${item.role || item.type || "item"}: ${cleanRecoveryText(text, 500)}`;
+  }).filter(Boolean).slice(-12);
+  const snapshot = recent.length ? recent.map(value => `- ${value}`).join("\n") : "- Свежий хвост истории отсутствует; использовать cold memory и состояние рабочей директории.";
   return [
     "# CONTEXT CHECKPOINT SUMMARY",
     "",
@@ -673,7 +743,7 @@ function buildCompactionRecoverySummary(body) {
     `- ${task}`,
     "",
     "## WORK COMPLETED",
-    "- Автоматическое сжатие было перехвачено прокси: ответ модели имел недопустимый формат и не был показан как вызов инструмента.",
+    old.sections.get("WORK COMPLETED") || "- Выполненные шаги необходимо подтвердить по свежему хвосту истории, Git и cold memory.",
     "",
     "## DECISIONS AND CONSTRAINTS",
     "- Отвечать пользователю на русском языке.",
@@ -681,10 +751,12 @@ function buildCompactionRecoverySummary(body) {
     "- Сохранить пользовательские изменения и проверить состояние файлов перед продолжением.",
     "",
     "## STATE SNAPSHOT",
-    "- Полный transcript до сжатия сохранён прокси как cold memory и доступен при необходимости точного восстановления деталей.",
+    "- Модель не вернула валидный свежий checkpoint; прокси сформировал восстановительный fallback и не переиспользовал старое резюме без пометки.",
+    snapshot,
+    "- Полный transcript до сжатия сохранён прокси как cold memory.",
     "",
     "## OPEN ISSUES",
-    "- Точный последний завершённый шаг нужно определить по рабочей директории и cold memory.",
+    "- Перед продолжением подтвердить последний завершённый шаг по свежему хвосту, рабочей директории и при необходимости cold memory.",
     "",
     "## PARKED TASKS",
     "- Нет задач, которые следует считать отменёнными.",
@@ -946,7 +1018,7 @@ function prepareRequest(original) {
 
   const reasoningNormalization = normalizeReasoningEffort(body);
   const instructionNormalization = normalizeInstructionMessages(body);
-  const autonomyRule = "AUTONOMOUS EXECUTION PROTOCOL: You must work autonomously until the user's task or multi-step plan is 100% complete. If you just finished a sub-step (e.g. edited a file, applied a patch, or ran a tool), DO NOT stop with an explanation, plan summary, or progress message. You MUST immediately execute the next tool call (e.g. run tests, perform git commit/push, or start the next step) in the very same turn. Only emit a final text message when ALL planned steps are fully implemented, verified, and pushed.";
+  const autonomyRule = "AUTONOMOUS EXECUTION PROTOCOL: You must work autonomously until the user's task or multi-step plan is 100% complete. If you just finished a sub-step (e.g. edited a file, applied a patch, or ran a tool), DO NOT stop with an explanation, plan summary, or progress message. You MUST immediately execute the next tool call. Before every git commit or push, run applicable syntax checks and tests; never publish code with a known validation failure. Only emit a final text message when ALL planned steps are fully implemented, verified, and pushed.";
   if (typeof body.instructions === "string" && !body.instructions.includes("AUTONOMOUS EXECUTION PROTOCOL:")) {
     body.instructions = `${body.instructions.trim()}\n\n${autonomyRule}`;
   } else if (!body.instructions) {
@@ -962,7 +1034,7 @@ function prepareRequest(original) {
     const lastRole = last && (last.role || (Array.isArray(last) ? last[0]?.role : null));
     const autonomyReminder = {
       role: "developer",
-      content: "REMINDER — AUTONOMOUS EXECUTION: You are mid-task. Do NOT stop or write a summary. IMMEDIATELY call the next required tool (run tests, git commit, git push, or next implementation step). Only send a final text message when ALL steps are 100% done and pushed."
+      content: "REMINDER — AUTONOMOUS EXECUTION: You are mid-task. Do NOT stop or write a summary. IMMEDIATELY call the next required tool. Run applicable syntax checks and tests before every git commit or push; never publish a known validation failure. Only send a final text message when ALL steps are 100% done and pushed."
     };
     if (lastRole === "tool" || lastRole === "function" || (last && last.type === "function_call_output") || (last && last.type === "custom_tool_call_output")) {
       body.input.push(autonomyReminder);
@@ -1167,6 +1239,7 @@ class SseTranslator {
     this.outputIndexByItem = new Map();
     this.nextOutputIndex = 0;
     this.text = "";
+    this.reasoningText = "";
     this.sawToolCall = false;
     this.sawCompletedForwarded = false;
     this.messageItems = new Set();
@@ -1255,6 +1328,12 @@ class SseTranslator {
     }
 
     this.normalizeEventShape(evt);
+
+    if (this.requestMeta.isCompaction && isReasoningStreamEvent(evt)) {
+      if (typeof evt.delta === "string" && evt.type?.endsWith(".delta")) this.reasoningText += evt.delta;
+      if (!this.reasoningText && evt.item?.type === "reasoning") this.reasoningText = reasoningTextFromObject(evt.item);
+      return [];
+    }
 
     if (evt.type === "response.output_text.delta" && typeof evt.delta === "string") {
       this.text += evt.delta;
@@ -1371,13 +1450,23 @@ class SseTranslator {
       const usage = usageFrom(evt);
       const outputLimitHit = this.requestMeta.isCompaction &&
         (usage?.output_tokens || 0) >= COMPACT_MAX_OUTPUT_TOKENS;
-      if (this.requestMeta.isCompaction && (!isValidCompactionText(this.text) || outputLimitHit)) {
-        const recovery = this.requestMeta.recoverySummary || buildCompactionRecoverySummary(null);
-        const repaired = repairCompactionText(this.text, recovery, outputLimitHit);
-        const metrics = compactionTextMetrics(this.text);
+      const outputCandidate = compactionCandidateText(this.text);
+      const reasoningCandidate = bestCompactionCandidate(this.reasoningText, reasoningTextFromObject(evt.response));
+      const compactCandidate = isValidCompactionText(outputCandidate) ? outputCandidate : bestCompactionCandidate(reasoningCandidate, outputCandidate);
+      if (this.requestMeta.isCompaction && isValidCompactionText(compactCandidate) && !outputLimitHit && compactCandidate !== this.text.trim()) {
         this.bufferedMessageEvents = [];
         this.sawCompletedForwarded = true;
-        diag(`COMPACTION_GUARD repaired_output chars=${this.text.length} prefix=${Number(metrics.prefix)} headings=${metrics.present} ordered=${Number(metrics.ordered)} forbidden=${Number(metrics.forbidden)} output_limit_hit=${Number(outputLimitHit)}; ${usageLine(usage)}`);
+        diag(`COMPACTION_GUARD recovered_reasoning chars=${compactCandidate.length}; ${usageLine(usage)}`);
+        if (this.requestMeta.checkpointPath) updateCheckpointSummary(this.requestMeta.checkpointPath, compactCandidate, usage);
+        return this.recoveredCompactionEvents(evt, compactCandidate);
+      }
+      if (this.requestMeta.isCompaction && (!isValidCompactionText(compactCandidate) || outputLimitHit)) {
+        const recovery = this.requestMeta.recoverySummary || buildCompactionRecoverySummary(null);
+        const repaired = repairCompactionText(compactCandidate, recovery, outputLimitHit);
+        const metrics = compactionTextMetrics(compactCandidate);
+        this.bufferedMessageEvents = [];
+        this.sawCompletedForwarded = true;
+        diag(`COMPACTION_GUARD repaired_output chars=${compactCandidate.length} prefix=${Number(metrics.prefix)} headings=${metrics.present} ordered=${Number(metrics.ordered)} forbidden=${Number(metrics.forbidden)} output_limit_hit=${Number(outputLimitHit)}; ${usageLine(usage)}`);
         if (this.requestMeta.checkpointPath) updateCheckpointSummary(this.requestMeta.checkpointPath, repaired, usage);
         return this.recoveredCompactionEvents(evt, repaired);
       }
@@ -1644,14 +1733,24 @@ function createServer() {
                 } else {
                   const kind = requestMeta.isCompaction ? "COMPACTION completed" : "response completed";
                   const usage = usageFrom(obj);
-                  const responseText = responseTextFromObject(obj);
+                  let responseText = responseTextFromObject(obj);
                   diag(`${kind}; ${usageLine(usage)}`);
                   if (requestMeta.isCompaction && requestMeta.checkpointPath) {
+                    const outputLimitHit = (usage?.output_tokens || 0) >= COMPACT_MAX_OUTPUT_TOKENS;
+                    const candidate = isValidCompactionText(compactionCandidateText(responseText))
+                      ? compactionCandidateText(responseText)
+                      : bestCompactionCandidate(reasoningTextFromObject(obj), responseText);
+                    const compactText = isValidCompactionText(candidate) && !outputLimitHit
+                      ? candidate
+                      : repairCompactionText(candidate, requestMeta.recoverySummary, outputLimitHit);
+                    if (compactText !== responseText) replaceResponseText(obj, compactText);
+                    responseText = compactText;
                     updateCheckpointSummary(requestMeta.checkpointPath, responseText, usage);
                   } else if (looksLikeProgressOnly(responseText)) {
                     diag(`TURN_GUARD WARNING progress-only terminal assistant message=${JSON.stringify(responseText.slice(0, 500))}`);
                   }
                 }
+                output = Buffer.from(JSON.stringify(obj));
               } catch { }
             } else if ((ures.statusCode || 200) >= 400 && raw.length) {
               const kind = requestMeta.isCompaction ? "COMPACTION upstream error" : "upstream error";
@@ -2144,8 +2243,30 @@ function selftest() {
       content: [{ type: "input_text", text: `Another language model started to solve this problem.\n${markdownCheckpoint}` }]
     }]
   });
-  if (preservedCheckpoint !== markdownCheckpoint) {
-    throw new Error("previous checkpoint recovery preservation failed");
+  if (!isValidCompactionText(preservedCheckpoint) || preservedCheckpoint === markdownCheckpoint ||
+    !preservedCheckpoint.includes("восстановительный fallback")) {
+    throw new Error("stale checkpoint fallback detection failed");
+  }
+  const freshReasoningCheckpoint = markdownCheckpoint.replace("Текущая задача", "Свежая задача после последних инструментов");
+  const reasoningOnlyCompaction = new SseTranslator(p.maps, { isCompaction: true, recoverySummary: preservedCheckpoint });
+  const hiddenReasoning = reasoningOnlyCompaction.translate("data: " + JSON.stringify({
+    type: "response.reasoning_text.delta",
+    item_id: "reasoning_compaction",
+    delta: freshReasoningCheckpoint
+  }));
+  if (hiddenReasoning.length !== 0) throw new Error("compaction reasoning leaked downstream");
+  const recoveredReasoning = parseSseJsonEvents(reasoningOnlyCompaction.translate("data: " + JSON.stringify({
+    type: "response.completed",
+    response: {
+      id: "resp_reasoning_compaction",
+      status: "completed",
+      output: [{ id: "reasoning_compaction", type: "reasoning", content: [{ type: "reasoning_text", text: freshReasoningCheckpoint }] }],
+      usage: { input_tokens: 100, output_tokens: 300, total_tokens: 400 }
+    }
+  })));
+  if (recoveredReasoning.length !== 7 || recoveredReasoning[2]?.delta !== freshReasoningCheckpoint ||
+    recoveredReasoning[6]?.response?.output?.[0]?.content?.[0]?.text !== freshReasoningCheckpoint) {
+    throw new Error("reasoning-only compaction recovery failed");
   }
   const wrappedCheckpoint = `Another language model started to solve this problem and produced a summary of its thinking process.\n${markdownCheckpoint}`;
   const checkpointHash = checkpointSummaryHash(wrappedCheckpoint);
