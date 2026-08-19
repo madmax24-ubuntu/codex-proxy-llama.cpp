@@ -1256,14 +1256,21 @@ function prepareRequest(original) {
   rewriteTools(body, maps);
   const historyRepairs = rewriteHistoryNode(body.input, maps);
 
-  if (Array.isArray(body.input)) {
+  if (Array.isArray(body.input) && body.input.length > 0) {
     const last = body.input[body.input.length - 1];
     const lastRole = last && (last.role || (Array.isArray(last) ? last[0]?.role : null));
+    const isUserOrTool = lastRole === "tool" || lastRole === "function" || lastRole === "user" ||
+      (last && (last.type === "function_call_output" || last.type === "custom_tool_call_output" || last.type === "user" || (last.type === "message" && last.role === "user")));
+    
+    // Also if the conversation ends on assistant message with previous tools, inject an action directive
+    const isTerminalWithoutTool = lastRole === "assistant" || (last && last.type === "message" && last.role === "assistant");
+
     const autonomyReminder = {
       role: "developer",
-      content: "REMINDER — AUTONOMOUS EXECUTION: You are mid-task. Do NOT stop or write a summary. IMMEDIATELY call the next required tool. Run applicable syntax checks and tests before every git commit or push; never publish a known validation failure. Only send a final text message when ALL steps are 100% done and pushed."
+      content: "REMINDER — AUTONOMOUS EXECUTION: Continue execution autonomously until the user's task or multi-step plan is 100% complete. Do NOT stop with an empty message or summary if work remains. IMMEDIATELY call the next required tool (e.g. apply_patch, shell_command, tests, git commit/push). Only send a final text message when ALL requested tasks are completely implemented, verified, and pushed."
     };
-    if (lastRole === "tool" || lastRole === "function" || (last && last.type === "function_call_output") || (last && last.type === "custom_tool_call_output")) {
+
+    if (isUserOrTool || isTerminalWithoutTool) {
       body.input.push(autonomyReminder);
     }
   }
