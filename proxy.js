@@ -2750,6 +2750,27 @@ function selftest() {
     !postCompact.input.some(isCompactionSummaryItem)) {
     throw new Error("post-compaction pruning lost current task/canonical context or kept stale user history");
   }
+  const postCompactTools = {
+    instructions: "BASE",
+    input: [
+      { role: "user", content: summaryPrefix + "\ncompact summary" },
+      { type: "function_call_output", output: "A".repeat(9000) },
+      { type: "custom_tool_call_output", output: "B".repeat(8000) },
+      { type: "function_call_output", output: "RECENT_ONE" },
+      { type: "custom_tool_call_output", output: "RECENT_TWO" }
+    ]
+  };
+  const toolPrune = prunePostCompactionToolOutputs(postCompactTools, 1200, 2);
+  if (toolPrune.truncated !== 2 || postCompactTools.input[1].output.length !== 1200 ||
+    postCompactTools.input[2].output.length !== 1200 ||
+    postCompactTools.input[3].output !== "RECENT_ONE" || postCompactTools.input[4].output !== "RECENT_TWO" ||
+    !postCompactTools.input[1].output.includes("POST-COMPACTION TOOL OUTPUT TRUNCATED")) {
+    throw new Error(`post-compaction tool output pruning failed: ${JSON.stringify(toolPrune)}`);
+  }
+  if (!appendPostCompactContinuationRule(postCompactTools) || appendPostCompactContinuationRule(postCompactTools) ||
+    !postCompactTools.instructions.includes("Treat every item in WORK COMPLETED as finished")) {
+    throw new Error("post-compaction continuation rule failed");
+  }
 
   if (compactCapped.body.reasoning?.effort !== COMPACT_REASONING_EFFORT ||
     (COMPACT_REASONING_BUDGET > 0 && compactCapped.body.thinking_budget_tokens !== COMPACT_REASONING_BUDGET) ||
@@ -2783,13 +2804,31 @@ function selftest() {
     if (recalled.length !== 1 || recalled[0].id !== "memory-selftest") throw new Error("episodic memory retrieval failed");
     const priorMemoryStore = MEMORY_STORE;
     MEMORY_STORE = memoryStore;
-    const recalledRequest = memoryInstructionForRequest({
+    MEMORY_INJECTED_TASKS.clear();
+    const memoryRequest = {
       instructions: "<environment_context><cwd>C:/work/rublox</cwd></environment_context>",
-      input: [{ role: "user", content: [{ type: "input_text", text: "Fix another BotBrain JavaScript syntax error" }] }]
-    });
-    MEMORY_STORE = priorMemoryStore;
+      input: [{ id: "memory-task-1", role: "user", content: [{ type: "input_text", text: "Fix another BotBrain JavaScript syntax error" }] }]
+    };
+    const recalledRequest = memoryInstructionForRequest(memoryRequest);
     if (recalledRequest.count !== 1 || !recalledRequest.block.includes("memory-selftest") || recalledRequest.block.length > MEMORY_MAX_CHARS) {
       throw new Error("episodic memory cross-session injection failed");
+    }
+    const repeatedRequest = memoryInstructionForRequest(memoryRequest);
+    const regressionRequest = memoryInstructionForRequest({
+      instructions: "<environment_context><cwd>C:/work/rublox</cwd></environment_context>",
+      input: [{ id: "memory-task-2", role: "user", content: "Ошибка BotBrain снова появилась, исправление не работает" }]
+    });
+    const compactedMemoryRequest = memoryInstructionForRequest({
+      instructions: "<environment_context><cwd>C:/work/rublox</cwd></environment_context>",
+      input: [
+        { id: "memory-task-3", role: "user", content: "Fix another BotBrain JavaScript syntax error" },
+        { role: "user", content: summaryPrefix + "\ncompact summary" }
+      ]
+    });
+    MEMORY_STORE = priorMemoryStore;
+    MEMORY_INJECTED_TASKS.clear();
+    if (repeatedRequest.count || regressionRequest.count || compactedMemoryRequest.count) {
+      throw new Error("episodic memory repeat/regression/post-compaction guard failed");
     }
     const memoryMeta = memoryRequestMeta({ input: [
       { role: "user", content: [{ type: "input_text", text: "Fix BotBrain syntax" }] },
