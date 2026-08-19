@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.7";
+const VERSION = "1.0.8";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -220,6 +220,22 @@ function isCompactionRequest(body) {
 }
 
 
+function pruneCompactionInputHistory(body, maxCharsPerToolOutput = 3000) {
+  if (!body || !Array.isArray(body.input)) return;
+  for (const item of body.input) {
+    if (!item || typeof item !== "object") continue;
+    if (item.type === "function_call_output" && Array.isArray(item.output)) {
+      for (const block of item.output) {
+        if (block && typeof block === "object" && typeof block.text === "string" && block.text.length > maxCharsPerToolOutput) {
+          block.text = block.text.slice(0, maxCharsPerToolOutput) + "\n...[truncated for compaction]...";
+        }
+      }
+    } else if (item.type === "function_call_output" && typeof item.output === "string" && item.output.length > maxCharsPerToolOutput) {
+      item.output = item.output.slice(0, maxCharsPerToolOutput) + "\n...[truncated for compaction]...";
+    }
+  }
+}
+
 function applyCompactionPolicy(body, limit = COMPACT_MAX_OUTPUT_TOKENS) {
   if (!body || typeof body !== "object") return body;
   body.max_output_tokens = Math.max(1024, Number(limit) || COMPACT_MAX_OUTPUT_TOKENS);
@@ -236,6 +252,7 @@ function applyCompactionPolicy(body, limit = COMPACT_MAX_OUTPUT_TOKENS) {
   }
   body.tool_choice = "none";
   body.parallel_tool_calls = false;
+  pruneCompactionInputHistory(body);
   const contract = "COMPACTION OUTPUT CONTRACT: Return only a dense checkpoint in the configured user language. The first line must be # CONTEXT CHECKPOINT SUMMARY. Use Markdown headings in this exact order: CURRENT TASK, WORK COMPLETED, DECISIONS AND CONSTRAINTS, STATE SNAPSHOT, OPEN ISSUES, PARKED TASKS, NEXT ACTION. Every heading is mandatory; write '- None.' when empty. Preserve concrete state from previous checkpoints. Never emit tool calls, XML-like tool tags, chain-of-thought, or assistant commentary. Target 1200-1800 tokens, start NEXT ACTION before token 2000, and finish it with a complete sentence.";
   const instructions = typeof body.instructions === "string" ? body.instructions.trim() : "";
   if (!instructions.includes("COMPACTION OUTPUT CONTRACT:")) {
