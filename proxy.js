@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.9";
+const VERSION = "1.0.10";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -253,11 +253,24 @@ function applyCompactionPolicy(body, limit = COMPACT_MAX_OUTPUT_TOKENS) {
   body.tool_choice = "none";
   body.parallel_tool_calls = false;
   pruneCompactionInputHistory(body);
-  const contract = "COMPACTION OUTPUT CONTRACT: Return only a dense checkpoint in the configured user language. The first line must be # CONTEXT CHECKPOINT SUMMARY. Use Markdown headings in this exact order: CURRENT TASK, WORK COMPLETED, DECISIONS AND CONSTRAINTS, STATE SNAPSHOT, OPEN ISSUES, PARKED TASKS, NEXT ACTION. Every heading is mandatory; write '- None.' when empty. Accurately reflect all completed work under WORK COMPLETED. Never list tasks that are already completed under OPEN ISSUES or NEXT ACTION. In NEXT ACTION, specify ONLY the next uncompleted step. Preserve concrete state from previous checkpoints. Never emit tool calls, XML-like tool tags, chain-of-thought, or assistant commentary. Target 1200-1800 tokens, start NEXT ACTION before token 2000, and finish it with a complete sentence.";
+  const contract = "COMPACTION OUTPUT CONTRACT: Return only a dense checkpoint in the configured user language. The first line must be # CONTEXT CHECKPOINT SUMMARY. Use Markdown headings in this exact order: CURRENT TASK, WORK COMPLETED, DECISIONS AND CONSTRAINTS, STATE SNAPSHOT, OPEN ISSUES, PARKED TASKS, NEXT ACTION. Every heading is mandatory; write '- None.' when empty. CRITICAL REQUIREMENT: Review the entire preceding history carefully. List ALL steps that were already implemented, edited, or tested under WORK COMPLETED. NEVER list completed tasks or already applied patches in OPEN ISSUES or NEXT ACTION. Under NEXT ACTION, strictly state ONLY the exact next uncompleted step based on the most recent turns. Target 1200-1800 tokens, start NEXT ACTION before token 2000, and finish it with a complete sentence.";
   const instructions = typeof body.instructions === "string" ? body.instructions.trim() : "";
   if (!instructions.includes("COMPACTION OUTPUT CONTRACT:")) {
     body.instructions = instructions ? `${instructions}\n\n${contract}` : contract;
   }
+
+  if (Array.isArray(body.input) && body.input.length) {
+    const lastItem = body.input[body.input.length - 1];
+    if (isUserMessageItem(lastItem)) {
+      const explicitPrompt = "Выполняется КОМПАКЦИЯ КОНТЕКСТА. Создай структурированный # CONTEXT CHECKPOINT SUMMARY на русском языке.\nВНИМАНИЕ: Все шаги, которые уже были выполнены или протестированы в диалоге выше, ОБЯЗАТЕЛЬНО запиши в '## WORK COMPLETED'. Ни в коем случае не повторяй их в '## NEXT ACTION' или '## OPEN ISSUES'. В '## NEXT ACTION' укажи ТОЛЬКО следующий невыполненный шаг, начиная ровно с того места, где прервалась работа.";
+      if (typeof lastItem.content === "string") {
+        lastItem.content = explicitPrompt;
+      } else if (Array.isArray(lastItem.content)) {
+        lastItem.content = [{ type: "input_text", text: explicitPrompt }];
+      }
+    }
+  }
+
   return body;
 }
 
