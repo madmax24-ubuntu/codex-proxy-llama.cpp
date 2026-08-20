@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.21";
+const VERSION = "1.0.22";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -1260,7 +1260,7 @@ function prepareRequest(original) {
     const isUserOrTool = lastRole === "tool" || lastRole === "function" ||
       (last && (last.type === "function_call_output" || last.type === "custom_tool_call_output"));
     
-    const isTerminalWithoutTool = lastRole === "assistant" || (last && last.type === "message" && last.role === "assistant");
+    const isTerminalWithoutTool = lastRole === "assistant" || (last && last.type === "message" && (last.role === "assistant" || !last.role));
 
     const autonomyDirective = "[AUTONOMOUS EXECUTION DIRECTIVE: Continue working autonomously. Do NOT stop with an empty message or progress summary. Immediately execute the next required tool call to complete, verify, and push all tasks.]";
 
@@ -1285,7 +1285,7 @@ function prepareRequest(original) {
       } else if (!last.output) {
         last.output = autonomyDirective;
       }
-    } else if (isTerminalWithoutTool) {
+    } else {
       if (typeof last.content === "string") {
         last.content = `${last.content.trim()}\n\n${autonomyDirective}`;
       } else if (Array.isArray(last.content) && last.content.length > 0) {
@@ -1303,6 +1303,8 @@ function prepareRequest(original) {
         } else {
           last.content.push({ type: "input_text", text: autonomyDirective });
         }
+      } else if (typeof last.text === "string") {
+        last.text = `${last.text.trim()}\n\n${autonomyDirective}`;
       }
     }
   }
@@ -1402,7 +1404,7 @@ function safeProgressMessageIds(obj) {
 function looksLikeProgressOnly(text) {
   const t = String(text || "").trim();
   if (!t || t.length > 800) return false;
-  return /^(?:понял|сейчас|начну|приступаю|давай|проверю|проанализирую|исправлю|i['’]ll\s+check|i\s+will|let\s+me|now\s+i\s+will|i\s+understand)\b/i.test(t);
+  return /^(?:понял|сейчас|начну|приступаю|давай|проверю|проанализирую|исправлю|оптимизация|теперь|далее|следующим|i['’]ll|i\s+will|let\s+me|now\s+i\s+will|i\s+understand|optimization|next)\b/i.test(t);
 }
 
 function bufferedMessageEventId(encoded) {
