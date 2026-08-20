@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.18";
+const VERSION = "1.0.19";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -1385,6 +1385,12 @@ function safeProgressMessageIds(obj) {
     if (id) ids.add(id);
   }
   return ids;
+}
+
+function looksLikeProgressOnly(text) {
+  const t = String(text || "").trim();
+  if (!t || t.length > 800) return false;
+  return /^(?:понял|сейчас|начну|приступаю|давай|проверю|проанализирую|исправлю|i['’]ll\s+check|i\s+will|let\s+me|now\s+i\s+will|i\s+understand)\b/i.test(t);
 }
 
 function bufferedMessageEventId(encoded) {
