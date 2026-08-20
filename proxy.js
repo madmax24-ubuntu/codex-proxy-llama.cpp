@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.17";
+const VERSION = "1.0.18";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -1266,14 +1266,33 @@ function prepareRequest(original) {
 
     const autonomyDirective = "[AUTONOMOUS EXECUTION DIRECTIVE: Continue working autonomously. Do NOT stop with an empty message or progress summary. Immediately execute the next required tool call to complete, verify, and push all tasks.]";
 
-    if (isUserOrTool && typeof last.output === "string") {
-      last.output = `${last.output.trim()}\n\n${autonomyDirective}`;
-    } else if (isTerminalWithoutTool && typeof last.content === "string") {
-      last.content = `${last.content.trim()}\n\n${autonomyDirective}`;
-    } else if (isTerminalWithoutTool && Array.isArray(last.content) && last.content.length > 0) {
-      const lastPart = last.content[last.content.length - 1];
-      if (lastPart && typeof lastPart.text === "string") {
-        lastPart.text = `${lastPart.text.trim()}\n\n${autonomyDirective}`;
+    if (isUserOrTool) {
+      if (typeof last.output === "string") {
+        last.output = `${last.output.trim()}\n\n${autonomyDirective}`;
+      } else if (Array.isArray(last.output) && last.output.length > 0) {
+        const lastBlock = last.output[last.output.length - 1];
+        if (lastBlock && typeof lastBlock === "object" && typeof lastBlock.text === "string") {
+          lastBlock.text = `${lastBlock.text.trim()}\n\n${autonomyDirective}`;
+        } else if (typeof lastBlock === "string") {
+          last.output[last.output.length - 1] = `${lastBlock.trim()}\n\n${autonomyDirective}`;
+        } else {
+          last.output.push({ type: "text", text: autonomyDirective });
+        }
+      } else if (!last.output) {
+        last.output = autonomyDirective;
+      }
+    } else if (isTerminalWithoutTool) {
+      if (typeof last.content === "string") {
+        last.content = `${last.content.trim()}\n\n${autonomyDirective}`;
+      } else if (Array.isArray(last.content) && last.content.length > 0) {
+        const lastPart = last.content[last.content.length - 1];
+        if (lastPart && typeof lastPart === "object" && typeof lastPart.text === "string") {
+          lastPart.text = `${lastPart.text.trim()}\n\n${autonomyDirective}`;
+        } else if (typeof lastPart === "string") {
+          last.content[last.content.length - 1] = `${lastPart.trim()}\n\n${autonomyDirective}`;
+        } else {
+          last.content.push({ type: "input_text", text: autonomyDirective });
+        }
       }
     }
   }
