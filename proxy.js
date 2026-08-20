@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.19";
+const VERSION = "1.0.20";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -1254,8 +1254,6 @@ function prepareRequest(original) {
   const postCompactToolPruning = prunePostCompactionToolOutputs(body);
   pruneOrphanProgressMessages(body);
   rewriteTools(body, maps);
-  const historyRepairs = rewriteHistoryNode(body.input, maps);
-
   if (Array.isArray(body.input) && body.input.length > 0) {
     const last = body.input[body.input.length - 1];
     const lastRole = last && (last.role || (Array.isArray(last) ? last[0]?.role : null));
@@ -1271,12 +1269,18 @@ function prepareRequest(original) {
         last.output = `${last.output.trim()}\n\n${autonomyDirective}`;
       } else if (Array.isArray(last.output) && last.output.length > 0) {
         const lastBlock = last.output[last.output.length - 1];
-        if (lastBlock && typeof lastBlock === "object" && typeof lastBlock.text === "string") {
-          lastBlock.text = `${lastBlock.text.trim()}\n\n${autonomyDirective}`;
+        if (lastBlock && typeof lastBlock === "object") {
+          if (typeof lastBlock.text === "string") {
+            lastBlock.text = `${lastBlock.text.trim()}\n\n${autonomyDirective}`;
+          } else if (typeof lastBlock.content === "string") {
+            lastBlock.content = `${lastBlock.content.trim()}\n\n${autonomyDirective}`;
+          } else {
+            last.output.push({ type: "input_text", text: autonomyDirective });
+          }
         } else if (typeof lastBlock === "string") {
           last.output[last.output.length - 1] = `${lastBlock.trim()}\n\n${autonomyDirective}`;
         } else {
-          last.output.push({ type: "text", text: autonomyDirective });
+          last.output.push({ type: "input_text", text: autonomyDirective });
         }
       } else if (!last.output) {
         last.output = autonomyDirective;
@@ -1286,8 +1290,14 @@ function prepareRequest(original) {
         last.content = `${last.content.trim()}\n\n${autonomyDirective}`;
       } else if (Array.isArray(last.content) && last.content.length > 0) {
         const lastPart = last.content[last.content.length - 1];
-        if (lastPart && typeof lastPart === "object" && typeof lastPart.text === "string") {
-          lastPart.text = `${lastPart.text.trim()}\n\n${autonomyDirective}`;
+        if (lastPart && typeof lastPart === "object") {
+          if (typeof lastPart.text === "string") {
+            lastPart.text = `${lastPart.text.trim()}\n\n${autonomyDirective}`;
+          } else if (typeof lastPart.content === "string") {
+            lastPart.content = `${lastPart.content.trim()}\n\n${autonomyDirective}`;
+          } else {
+            last.content.push({ type: "input_text", text: autonomyDirective });
+          }
         } else if (typeof lastPart === "string") {
           last.content[last.content.length - 1] = `${lastPart.trim()}\n\n${autonomyDirective}`;
         } else {
@@ -1296,6 +1306,8 @@ function prepareRequest(original) {
       }
     }
   }
+
+  const historyRepairs = rewriteHistoryNode(body.input, maps);
 
   if (Array.isArray(body.include)) {
     body.include = body.include.filter(x =>
