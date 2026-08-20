@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.20";
+const VERSION = "1.0.21";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -1384,8 +1384,8 @@ function isSafeProgressText(text) {
   if (!value || value.length > PROGRESS_MAX_CHARS) return false;
   if (/<\/?tool_call\b|<function=|<parameter=|<\|(?:tool_call|im_start|im_end)\|>|assistant\s+to=/i.test(value)) return false;
   if (/```|^\s*[\[{][\s\S]*(?:"command"|"arguments"|"call_id")/i.test(value)) return false;
-  if (/^(?:analysis|reasoning|thoughts?|we need|i need|i should|let(?:'s| us) (?:analy[sz]e|reason|think)|now i (?:understand|see)|hmm|wait\b|interesting\b|анализ|рассуждени|мне нужно|нам нужно|надо подумать|хм\b|стоп\b|интересно\b)/i.test(value)) return false;
-  return value.split(/\r?\n/).length <= 10 && value.split(/[.!?…。！？]+/).filter(Boolean).length <= 8;
+  if (/^(?:analysis\b|reasoning\b|thoughts?\b|we need\b|i need\b|i should\b|let(?:'s| us) (?:analy[sz]e|reason|think)|now i (?:understand|see)|wait\b|interesting\b|анализ\b|рассуждени|мне нужно\b|нам нужно\b|надо подумать\b|хм\b|стоп\b|интересно\b)/i.test(value)) return false;
+  return value.split(/\r?\n/).length <= 15;
 }
 
 function safeProgressMessageIds(obj) {
