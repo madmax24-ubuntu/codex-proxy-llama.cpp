@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.22";
+const VERSION = "1.0.23";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -1636,6 +1636,8 @@ class SseTranslator {
     this.sawCompletedForwarded = false;
     this.messageItems = new Set();
     this.bufferedMessageEvents = [];
+    this.allowAutoContinue = requestMeta.allowAutoContinue === true;
+    this.needsContinuation = false;
   }
 
   recoveredCompactionEvents(evt, text) {
@@ -1880,6 +1882,12 @@ class SseTranslator {
         updateCheckpointSummary(this.requestMeta.checkpointPath, this.text, usage);
       } else if (!this.sawToolCall && looksLikeProgressOnly(this.text)) {
         diag(`TURN_GUARD WARNING progress-only terminal assistant message=${JSON.stringify(this.text.slice(0, 500))}`);
+        if (this.allowAutoContinue) {
+          this.needsContinuation = true;
+          this.sawCompletedForwarded = false;
+          diag("TURN_GUARD AUTO_CONTINUE: Intercepted response.completed; triggering tool call generation");
+          return [...buffered];
+        }
       }
       if (!this.requestMeta.isCompaction && !this.sawToolCall) {
         rememberCompletedTask(this.requestMeta.memoryTask, this.text || responseTextFromObject(evt.response));
@@ -1948,6 +1956,8 @@ function createServer() {
           const memory = memoryInstructionForRequest(parsed);
           requestMeta.memoryTask = memory.meta;
           const prepared = prepareRequest(parsed);
+          requestMeta.prepared = prepared;
+          requestMeta.allowAutoContinue = isResponses && !requestMeta.isCompaction;
           if (memory.block) {
             prepared.body.instructions = `${String(prepared.body.instructions || "").trim()}\n\n${memory.block}`.trim();
             diag(`MEMORY injected count=${memory.count} chars=${memory.block.length} project=${JSON.stringify(memory.meta.project)}`);
@@ -2080,8 +2090,6 @@ function createServer() {
 
             ures.on("end", () => {
               if (streamFinished) return;
-              streamFinished = true;
-              upstreamFinished = true;
               if (pending) {
                 if (pending.startsWith("data:")) {
                   const payload = pending.slice(5).trimStart();
@@ -2091,7 +2099,72 @@ function createServer() {
                   }
                 }
                 for (const outLine of tr.translate(pending)) res.write(outLine);
+                pending = "";
               }
+
+              if (tr.needsContinuation && !downstreamClosed && requestMeta.prepared?.body) {
+                diag("AUTO_CONTINUE: Executing follow-up request to force immediate tool call...");
+                tr.needsContinuation = false;
+                tr.allowAutoContinue = false;
+
+                const followUpBody = clone(requestMeta.prepared.body);
+                if (Array.isArray(followUpBody.input)) {
+                  followUpBody.input.push({
+                    role: "assistant",
+                    content: [{ type: "output_text", text: tr.text }]
+                  });
+                  followUpBody.input.push({
+                    role: "user",
+                    content: [{ type: "input_text", text: "[AUTONOMOUS SYSTEM DIRECTIVE: You explained what you will do next. Execute the tool call now without commentary!]" }]
+                  });
+                }
+                const followUpOutbound = Buffer.from(JSON.stringify(followUpBody));
+                const followUpHeaders = copyHeaders(req.headers);
+                followUpHeaders["content-length"] = String(followUpOutbound.length);
+                followUpHeaders["accept-encoding"] = "identity";
+                followUpHeaders["connection"] = "close";
+
+                const followUpReq = transport.request({
+                  protocol: UPSTREAM.protocol,
+                  hostname: UPSTREAM.hostname,
+                  port: UPSTREAM.port || (UPSTREAM.protocol === "https:" ? 443 : 80),
+                  method: req.method,
+                  path: req.url,
+                  headers: followUpHeaders
+                }, followUpRes => {
+                  upstreamResponse = followUpRes;
+                  followUpRes.setEncoding("utf8");
+                  let fPending = "";
+                  followUpRes.on("data", chunk => {
+                    fPending += chunk;
+                    const lines = fPending.split(/\r?\n/);
+                    fPending = lines.pop() || "";
+                    for (const line of lines) {
+                      for (const outLine of tr.translate(line)) res.write(outLine);
+                    }
+                  });
+                  followUpRes.on("end", () => {
+                    streamFinished = true;
+                    upstreamFinished = true;
+                    if (fPending) {
+                      for (const outLine of tr.translate(fPending)) res.write(outLine);
+                    }
+                    diag("AUTO_CONTINUE: Follow-up tool call stream finished");
+                    res.end();
+                  });
+                  followUpRes.on("error", err => {
+                    finishBrokenStream(`AUTO_CONTINUE ERROR error=${err.message}`);
+                  });
+                });
+                followUpReq.on("error", err => {
+                  finishBrokenStream(`AUTO_CONTINUE REQUEST_ERROR error=${err.message}`);
+                });
+                followUpReq.end(followUpOutbound);
+                return;
+              }
+
+              streamFinished = true;
+              upstreamFinished = true;
               if (!sawResponseCompleted) {
                 diag(`STREAM_END ERROR upstream_missing_completed status=${ures.statusCode || 0} done=${sawDoneMarker ? 1 : 0}`);
               } else if (!tr.sawCompletedForwarded) {
