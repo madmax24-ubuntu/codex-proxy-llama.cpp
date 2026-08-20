@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.23";
+const VERSION = "1.0.24";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -539,10 +539,7 @@ function replaceResponseText(obj, text) {
 }
 
 function looksLikeProgressOnly(text) {
-  const t = String(text || "").trim();
-  if (!t) return false;
-  return /^(?:i(?:'ll| will| am going to)|let me|first[, ]|next[, ]|i(?:'m| am) going to|сейчас я|сначала я|далее я|теперь я|продолжу|проверю|посмотрю)\b/i.test(t) ||
-    /\b(?:i(?:'ll| will) (?:check|inspect|verify|open|read|run|continue|start)|let me (?:check|inspect|verify|open|read|run|continue)|сейчас (?:проверю|посмотрю|открою|запущу))\b/i.test(t);
+  return true;
 }
 
 function canonicalNs(ns) {
@@ -1638,6 +1635,7 @@ class SseTranslator {
     this.bufferedMessageEvents = [];
     this.allowAutoContinue = requestMeta.allowAutoContinue === true;
     this.needsContinuation = false;
+    this.continuationDepth = requestMeta.continuationDepth || 0;
   }
 
   recoveredCompactionEvents(evt, text) {
@@ -1880,14 +1878,14 @@ class SseTranslator {
         const metrics = compactionTextMetrics(this.text);
         diag(`COMPACTION_SUMMARY accepted chars=${this.text.length} headings=${metrics.present} output_limit_hit=${Number((usage?.output_tokens || 0) >= COMPACT_MAX_OUTPUT_TOKENS)}`);
         updateCheckpointSummary(this.requestMeta.checkpointPath, this.text, usage);
-      } else if (!this.sawToolCall && looksLikeProgressOnly(this.text)) {
-        diag(`TURN_GUARD WARNING progress-only terminal assistant message=${JSON.stringify(this.text.slice(0, 500))}`);
-        if (this.allowAutoContinue) {
-          this.needsContinuation = true;
-          this.sawCompletedForwarded = false;
-          diag("TURN_GUARD AUTO_CONTINUE: Intercepted response.completed; triggering tool call generation");
-          return [...buffered];
-        }
+      } else if (!this.sawToolCall && this.allowAutoContinue && this.continuationDepth < 3) {
+        const reason = !this.text.trim() ? "empty-response" : "text-only-no-tool";
+        diag(`TURN_GUARD AUTO_CONTINUE depth=${this.continuationDepth} reason=${reason} text=${JSON.stringify(this.text.slice(0, 200))}`);
+        this.needsContinuation = true;
+        this.sawCompletedForwarded = false;
+        return [...buffered];
+      } else if (!this.sawToolCall) {
+        diag(`TURN_GUARD PASS-THROUGH depth=${this.continuationDepth} text=${JSON.stringify(this.text.slice(0, 200))}`);
       }
       if (!this.requestMeta.isCompaction && !this.sawToolCall) {
         rememberCompletedTask(this.requestMeta.memoryTask, this.text || responseTextFromObject(evt.response));
@@ -2115,7 +2113,10 @@ function createServer() {
                   });
                   followUpBody.input.push({
                     role: "user",
-                    content: [{ type: "input_text", text: "[AUTONOMOUS SYSTEM DIRECTIVE: You explained what you will do next. Execute the tool call now without commentary!]" }]
+                    content: [{ type: "input_text", text: tr.text.trim()
+                      ? "[SYSTEM: You sent a text message but no tool call. Your task is NOT complete. You MUST immediately invoke the appropriate tool now — do not explain, just call the tool.]"
+                      : "[SYSTEM: Empty response detected. Your task is NOT complete. You MUST immediately invoke a tool to continue. Do not write text — call the tool now.]"
+                    }]
                   });
                 }
                 const followUpOutbound = Buffer.from(JSON.stringify(followUpBody));
@@ -2124,6 +2125,11 @@ function createServer() {
                 followUpHeaders["accept-encoding"] = "identity";
                 followUpHeaders["connection"] = "close";
 
+                const followUpTr = new SseTranslator(maps, {
+                  ...requestMeta,
+                  allowAutoContinue: true,
+                  continuationDepth: (requestMeta.continuationDepth || 0) + 1
+                });
                 const followUpReq = transport.request({
                   protocol: UPSTREAM.protocol,
                   hostname: UPSTREAM.hostname,
@@ -2140,15 +2146,40 @@ function createServer() {
                     const lines = fPending.split(/\r?\n/);
                     fPending = lines.pop() || "";
                     for (const line of lines) {
-                      for (const outLine of tr.translate(line)) res.write(outLine);
+                      for (const outLine of followUpTr.translate(line)) res.write(outLine);
                     }
                   });
                   followUpRes.on("end", () => {
+                    if (fPending) {
+                      for (const outLine of followUpTr.translate(fPending)) res.write(outLine);
+                    }
+                    if (followUpTr.needsContinuation && !downstreamClosed && requestMeta.prepared?.body) {
+                      diag(`AUTO_CONTINUE: depth=${followUpTr.continuationDepth} chaining another follow-up...`);
+                      followUpTr.needsContinuation = false;
+                      const chainBody = clone(requestMeta.prepared.body);
+                      if (Array.isArray(chainBody.input)) {
+                        chainBody.input.push({ role: "assistant", content: [{ type: "output_text", text: followUpTr.text || tr.text }] });
+                        chainBody.input.push({ role: "user", content: [{ type: "input_text", text: "[SYSTEM: Still no tool call. Task is not done. Call a tool NOW. Do not write text.]" }] });
+                      }
+                      const chainOutbound = Buffer.from(JSON.stringify(chainBody));
+                      const chainHeaders = copyHeaders(req.headers);
+                      chainHeaders["content-length"] = String(chainOutbound.length);
+                      chainHeaders["accept-encoding"] = "identity";
+                      chainHeaders["connection"] = "close";
+                      const chainTr = new SseTranslator(maps, { ...requestMeta, allowAutoContinue: false, continuationDepth: followUpTr.continuationDepth });
+                      const chainReq = transport.request({ protocol: UPSTREAM.protocol, hostname: UPSTREAM.hostname, port: UPSTREAM.port || (UPSTREAM.protocol === "https:" ? 443 : 80), method: req.method, path: req.url, headers: chainHeaders }, chainRes => {
+                        chainRes.setEncoding("utf8");
+                        let cPending = "";
+                        chainRes.on("data", chunk => { cPending += chunk; const ls = cPending.split(/\r?\n/); cPending = ls.pop() || ""; for (const l of ls) for (const o of chainTr.translate(l)) res.write(o); });
+                        chainRes.on("end", () => { streamFinished = true; upstreamFinished = true; if (cPending) for (const o of chainTr.translate(cPending)) res.write(o); diag("AUTO_CONTINUE: chain stream finished"); res.end(); });
+                        chainRes.on("error", err => finishBrokenStream(`AUTO_CONTINUE CHAIN ERROR error=${err.message}`));
+                      });
+                      chainReq.on("error", err => finishBrokenStream(`AUTO_CONTINUE CHAIN REQ ERROR error=${err.message}`));
+                      chainReq.end(chainOutbound);
+                      return;
+                    }
                     streamFinished = true;
                     upstreamFinished = true;
-                    if (fPending) {
-                      for (const outLine of tr.translate(fPending)) res.write(outLine);
-                    }
                     diag("AUTO_CONTINUE: Follow-up tool call stream finished");
                     res.end();
                   });
