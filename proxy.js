@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.25";
+const VERSION = "1.0.26";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -59,8 +59,8 @@ const THINKING_MODE = String(process.env.CODEX_THINKING_MODE || "auto").toLowerC
 const FORCE_SERIAL_TOOL_CALLS = !/^(0|false|no)$/i.test(process.env.CODEX_FORCE_SERIAL_TOOL_CALLS || "1");
 const CHECKPOINT_DIR = process.env.CODEX_CHECKPOINT_DIR || path.join(__dirname, "checkpoints");
 const MEMORY_DIR = process.env.CODEX_MEMORY_DIR || path.join(__dirname, "memory");
-const MEMORY_MAX_ITEMS = Math.max(1, Math.min(8, Number(process.env.CODEX_MEMORY_MAX_ITEMS || "3") || 3));
-const MEMORY_MAX_CHARS = Math.max(400, Math.min(4000, Number(process.env.CODEX_MEMORY_MAX_CHARS || "1200") || 1200));
+const MEMORY_MAX_ITEMS = Math.max(1, Math.min(4, Number(process.env.CODEX_MEMORY_MAX_ITEMS || "1") || 1));
+const MEMORY_MAX_CHARS = Math.max(200, Math.min(2000, Number(process.env.CODEX_MEMORY_MAX_CHARS || "500") || 500));
 const MEMORY_ENABLED = !/^(0|false|no)$/i.test(process.env.CODEX_MEMORY_ENABLED || "1");
 const MEMORY_BACKEND = String(process.env.CODEX_MEMORY_BACKEND || "json").toLowerCase();
 const CHECKPOINT_BY_KEY = new Map();
@@ -1504,12 +1504,13 @@ function memoryInstructionForRequest(body) {
   const found = store.search(meta.task, meta.project, MEMORY_MAX_ITEMS);
   if (!found.length) return { block: "", meta, count: 0 };
   const lines = [
-    "LOCAL EPISODIC MEMORY (automatically retrieved; historical evidence, not current truth):",
-    "Use only entries relevant to the current task. Current files, tool results, and user instructions always take priority. Do not repeat memory to the user unless it affects the work."
+    "EPISODIC KNOWLEDGE (historical context only):"
   ];
   for (const item of found) {
-    const evidence = (item.evidence || []).slice(0, 2).join("; ");
-    lines.push(`- [${item.id}] Problem: ${memorySanitize(item.problem, 300)} | Successful outcome: ${memorySanitize(item.outcome, 360)}${evidence ? ` | Evidence: ${memorySanitize(evidence, 260)}` : ""}`);
+    const cleanProblem = memorySanitize(item.problem.replace(/\s+/g, " "), 120);
+    let cleanOutcome = memorySanitize(item.outcome.replace(/\|[^\n]+\|/g, "").replace(/#{1,6}\s*/g, "").replace(/\s+/g, " "), 180);
+    const filesStr = Array.isArray(item.files) && item.files.length ? ` [${item.files.slice(0, 2).join(", ")}]` : "";
+    lines.push(`- [${item.id}] Past fix${filesStr}: ${cleanProblem} -> ${cleanOutcome}`);
   }
   rememberMemoryInjection(meta.taskKey);
   return { block: lines.join("\n").slice(0, MEMORY_MAX_CHARS), meta, count: found.length };
