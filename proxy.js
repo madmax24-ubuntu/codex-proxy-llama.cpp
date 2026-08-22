@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.26";
+const VERSION = "1.0.27";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -1064,8 +1064,12 @@ function prunePostCompactionToolOutputs(body, maxChars = POST_COMPACT_TOOL_OUTPU
 
 function appendPostCompactContinuationRule(body) {
   if (!body || typeof body !== "object" || !Array.isArray(body.input) || !body.input.some(isCompactionSummaryItem)) return false;
-  const marker = "POST-COMPACTION CONTINUATION RULE:";
-  const rule = `${marker} The checkpoint is the authoritative task state. Treat every item in WORK COMPLETED as finished and never redo it. Ignore older user requests superseded by CURRENT TASK. Execute exactly NEXT ACTION, using current files and new tool results as truth. Repeat a setup, bridge connection, baseline check, test, edit, commit, or push only when NEXT ACTION explicitly requires it or current evidence proves it invalid.`;
+  const marker = "CRITICAL POST-COMPACTION CONTINUATION PROTOCOL:";
+  const rule = `${marker}
+- The CONTEXT CHECKPOINT SUMMARY in history is the authoritative task state. Treat every item in WORK COMPLETED as finished and never redo it.
+- Every single item in "WORK COMPLETED" has ALREADY been implemented, tested, verified, and committed. DO NOT re-diagnose, re-analyze, or re-implement anything listed in WORK COMPLETED.
+- DO NOT start from scratch with general greetings or exploratory inspections (e.g. "Понял ситуацию, проведу диагностику").
+- Immediately execute the EXACT step described in "NEXT ACTION". Proceed with the remaining work autonomously until the overall user goal is 100% finished.`;
   const instructions = String(body.instructions || "").trim();
   if (instructions.includes(marker)) return false;
   body.instructions = instructions ? `${instructions}\n\n${rule}` : rule;
