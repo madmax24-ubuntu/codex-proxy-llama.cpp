@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.28";
+const VERSION = "1.0.29";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -1067,7 +1067,8 @@ function appendPostCompactContinuationRule(body) {
   const marker = "CRITICAL POST-COMPACTION CONTINUATION PROTOCOL:";
   const rule = `${marker}
 - The CONTEXT CHECKPOINT SUMMARY in history is the authoritative task state. Treat every item in WORK COMPLETED as finished and never redo it.
-- Every single item in "WORK COMPLETED" has ALREADY been implemented, tested, verified, and committed. DO NOT re-diagnose, re-analyze, or re-implement anything listed in WORK COMPLETED.
+- Older user messages prior to the checkpoint describe HISTORICAL starting problems. Everything listed in "WORK COMPLETED" has ALREADY been fixed, verified in code, and committed to git. DO NOT assume old complaints are still active if they are marked resolved in WORK COMPLETED.
+- DO NOT re-diagnose, re-analyze, or re-verify finished items from WORK COMPLETED.
 - DO NOT start from scratch with general greetings or exploratory inspections (e.g. "Понял ситуацию, проведу диагностику").
 - Immediately execute the EXACT step described in "NEXT ACTION". Proceed with the remaining work autonomously until the overall user goal is 100% finished.`;
   const instructions = String(body.instructions || "").trim();
