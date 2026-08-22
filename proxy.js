@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.29";
+const VERSION = "1.0.30";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -2095,7 +2095,16 @@ function createServer() {
             let sawDoneMarker = false;
             let streamFinished = false;
 
+            const heartbeatInterval = setInterval(() => {
+              if (streamFinished || res.writableEnded || res.destroyed) {
+                clearInterval(heartbeatInterval);
+                return;
+              }
+              try { res.write(":\n\n"); } catch {}
+            }, 5000);
+
             const finishBrokenStream = reason => {
+              clearInterval(heartbeatInterval);
               if (streamFinished) return;
               streamFinished = true;
               upstreamFinished = true;
@@ -2261,6 +2270,7 @@ function createServer() {
                 return;
               }
 
+              clearInterval(heartbeatInterval);
               streamFinished = true;
               upstreamFinished = true;
               if (!sawResponseCompleted) {
