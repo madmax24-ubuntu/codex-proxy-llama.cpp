@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.27";
+const VERSION = "1.0.28";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -1410,8 +1410,22 @@ function safeProgressMessageIds(obj) {
 
 function looksLikeProgressOnly(text) {
   const t = String(text || "").trim();
-  if (!t || t.length > 800) return false;
-  return /^(?:понял|сейчас|начну|приступаю|давай|проверю|проанализирую|исправлю|оптимизация|теперь|далее|следующим|i['’]ll|i\s+will|let\s+me|now\s+i\s+will|i\s+understand|optimization|next)\b/i.test(t);
+  if (!t || t.length > 600) return false;
+  return /^(?:понял|сейчас|начну|приступаю|давай|проверю|проанализирую|исправлю|оптимизация|теперь|далее|следующим|шаг\s+\d|i['’]ll|i\s+will|let\s+me|now\s+i\s+will|i\s+understand|optimization|next|step\s+\d)\b/i.test(t);
+}
+
+function looksLikeTaskCompletion(text) {
+  const t = String(text || "").trim();
+  if (!t || t.length < 10) return false;
+  // Clear completion patterns: summary headings, checks, git pushes, final statements
+  if (/(?:задач\w*\s+выполнен|готов[оа]|всё\s+исправлен|тестирован\w*\s+завершен|все\s+тесты\s+пройдены|успешно\s+(?:проверен|выполнен|исправлен|завершен)|что\s+было\s+сделано|итоги?|результаты?|сводка|task\s+completed|all\s+tests?\s+pass|successfully\s+(?:verified|completed|fixed)|summary|changes\s+made|what\s+changed|work\s+completed|✅|🎉)/i.test(t)) {
+    return true;
+  }
+  // If the message is a comprehensive report (>300 chars, multiple bullet points or sentences) and NOT starting with progress words
+  if (t.length > 300 && (t.includes("- ") || t.includes("1.") || t.includes("\n\n")) && !looksLikeProgressOnly(t)) {
+    return true;
+  }
+  return false;
 }
 
 function bufferedMessageEventId(encoded) {
@@ -1903,14 +1917,14 @@ class SseTranslator {
         const metrics = compactionTextMetrics(this.text);
         diag(`COMPACTION_SUMMARY accepted chars=${this.text.length} headings=${metrics.present} output_limit_hit=${Number((usage?.output_tokens || 0) >= COMPACT_MAX_OUTPUT_TOKENS)}`);
         updateCheckpointSummary(this.requestMeta.checkpointPath, this.text, usage);
-      } else if (!this.sawToolCall && !looksLikeTaskCompletion(this.text) && this.allowAutoContinue && this.continuationDepth < 3) {
-        const reason = !this.text.trim() ? "empty-response" : "text-only-no-tool";
+      } else if (!this.sawToolCall && (looksLikeProgressOnly(this.text) || !this.text.trim()) && this.allowAutoContinue && this.continuationDepth < 2) {
+        const reason = !this.text.trim() ? "empty-response" : "progress-only-no-tool";
         diag(`TURN_GUARD AUTO_CONTINUE depth=${this.continuationDepth} reason=${reason} text=${JSON.stringify(this.text.slice(0, 200))}`);
         this.needsContinuation = true;
         this.sawCompletedForwarded = false;
-        return [...buffered];
+        return [];
       } else if (!this.sawToolCall) {
-        const passReason = looksLikeTaskCompletion(this.text) ? "task-completed-signal" : "depth-or-disallowed";
+        const passReason = looksLikeTaskCompletion(this.text) ? "task-completed-signal" : "final-text-response";
         diag(`TURN_GUARD PASS-THROUGH depth=${this.continuationDepth} reason=${passReason} text=${JSON.stringify(this.text.slice(0, 200))}`);
       }
       if (!this.requestMeta.isCompaction && !this.sawToolCall) {
