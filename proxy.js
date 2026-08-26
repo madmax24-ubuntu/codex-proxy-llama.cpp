@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.30";
+const VERSION = "1.0.31";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -57,6 +57,9 @@ const SUPPORTED_REASONING_LEVELS = new Set(String(process.env.CODEX_REASONING_LE
   .split(",").map(x => x.trim().toLowerCase()).filter(Boolean));
 const THINKING_MODE = String(process.env.CODEX_THINKING_MODE || "auto").toLowerCase();
 const FORCE_SERIAL_TOOL_CALLS = !/^(0|false|no)$/i.test(process.env.CODEX_FORCE_SERIAL_TOOL_CALLS || "1");
+const UPSTREAM_RETRY_ATTEMPTS = Math.max(0, Math.min(60, Number(process.env.CODEX_UPSTREAM_RETRY_ATTEMPTS || "30") || 30));
+const UPSTREAM_RETRY_BASE_MS = Math.max(100, Number(process.env.CODEX_UPSTREAM_RETRY_BASE_MS || "1000") || 1000);
+const UPSTREAM_RETRY_MAX_MS = Math.max(UPSTREAM_RETRY_BASE_MS, Number(process.env.CODEX_UPSTREAM_RETRY_MAX_MS || "10000") || 10000);
 const CHECKPOINT_DIR = process.env.CODEX_CHECKPOINT_DIR || path.join(__dirname, "checkpoints");
 const MEMORY_DIR = process.env.CODEX_MEMORY_DIR || path.join(__dirname, "memory");
 const MEMORY_MAX_ITEMS = Math.max(1, Math.min(4, Number(process.env.CODEX_MEMORY_MAX_ITEMS || "1") || 1));
@@ -2069,15 +2072,38 @@ function createServer() {
         let upstreamResponse = null;
         let upstreamFinished = false;
         let downstreamClosed = false;
-        const ureq = transport.request({
-          protocol: UPSTREAM.protocol,
-          hostname: UPSTREAM.hostname,
-          port: UPSTREAM.port || (UPSTREAM.protocol === "https:" ? 443 : 80),
-          method: req.method,
-          path: req.url,
-          headers
-        }, ures => {
+        let responseCommitted = false;
+        let responseCompletedForwarded = false;
+        let retryTimer = null;
+        let ureq = null;
+        const retryDelay = attempt => Math.min(UPSTREAM_RETRY_MAX_MS, UPSTREAM_RETRY_BASE_MS * (2 ** Math.min(attempt, 4)));
+        const retryableStatus = status => status === 408 || status === 409 || status === 429 || status >= 500;
+        const scheduleUpstreamRetry = (attempt, reason) => {
+          if (downstreamClosed || responseCommitted || attempt >= UPSTREAM_RETRY_ATTEMPTS) return false;
+          const delay = retryDelay(attempt);
+          diag(`UPSTREAM_RETRY scheduled attempt=${attempt + 1}/${UPSTREAM_RETRY_ATTEMPTS} delay_ms=${delay} reason=${reason}`);
+          retryTimer = setTimeout(() => {
+            retryTimer = null;
+            if (!downstreamClosed && !res.writableEnded && !res.destroyed) startUpstreamAttempt(attempt + 1);
+          }, delay);
+          return true;
+        };
+        const startUpstreamAttempt = attempt => {
+          const attemptState = { done: false };
+          ureq = transport.request({
+            protocol: UPSTREAM.protocol,
+            hostname: UPSTREAM.hostname,
+            port: UPSTREAM.port || (UPSTREAM.protocol === "https:" ? 443 : 80),
+            method: req.method,
+            path: req.url,
+            headers
+          }, ures => {
           upstreamResponse = ures;
+          if (retryableStatus(ures.statusCode || 0) && !responseCommitted && attempt < UPSTREAM_RETRY_ATTEMPTS) {
+            attemptState.done = true;
+            ures.resume();
+            if (scheduleUpstreamRetry(attempt, `status_${ures.statusCode || 0}`)) return;
+          }
           const ct = String(ures.headers["content-type"] || "");
           const isSse = ct.includes("text/event-stream");
 
@@ -2086,7 +2112,7 @@ function createServer() {
             rh["content-type"] = ct || "text/event-stream";
             rh["cache-control"] = ures.headers["cache-control"] || "no-cache";
             rh["connection"] = "close";
-            res.writeHead(ures.statusCode || 200, rh);
+            if (!res.headersSent) res.writeHead(ures.statusCode || 200, rh);
 
             const tr = new SseTranslator(maps, requestMeta);
             ures.setEncoding("utf8");
@@ -2094,6 +2120,37 @@ function createServer() {
             let sawResponseCompleted = false;
             let sawDoneMarker = false;
             let streamFinished = false;
+            const attemptBuffer = [];
+            const writeTranslated = lines => {
+              if (!Array.isArray(lines) || !lines.length) return;
+              if (responseCommitted) {
+                for (const line of lines) res.write(line);
+                return;
+              }
+              attemptBuffer.push(...lines);
+              let commit = false;
+              let completed = false;
+              for (const line of lines) {
+                if (!line.startsWith("data:")) continue;
+                const payload = line.slice(5).trimStart();
+                if (!payload || payload === "[DONE]") continue;
+                try {
+                  const evt = JSON.parse(payload);
+                  if (evt.type === "response.completed" || evt.type === "response.failed" || evt.type === "response.incomplete" || evt.type === "error") {
+                    commit = true;
+                    completed = evt.type === "response.completed";
+                  } else if (evt.type === "response.output_item.done" &&
+                             (evt.item?.type === "function_call" || evt.item?.type === "custom_tool_call")) {
+                    commit = true;
+                  }
+                } catch { }
+              }
+              if (!commit) return;
+              responseCommitted = true;
+              if (completed) responseCompletedForwarded = true;
+              for (const line of attemptBuffer) res.write(line);
+              attemptBuffer.length = 0;
+            };
 
             const heartbeatInterval = setInterval(() => {
               if (streamFinished || res.writableEnded || res.destroyed) {
@@ -2107,8 +2164,11 @@ function createServer() {
               clearInterval(heartbeatInterval);
               if (streamFinished) return;
               streamFinished = true;
+              attemptState.done = true;
+              attemptBuffer.length = 0;
+              if (scheduleUpstreamRetry(attempt, reason)) return;
               upstreamFinished = true;
-              diag(reason);
+              diag(`${reason} retries_exhausted=${attempt}`);
               if (!res.writableEnded && !res.destroyed) res.end();
             };
 
@@ -2132,7 +2192,7 @@ function createServer() {
                     try { if (JSON.parse(payload)?.type === "response.completed") sawResponseCompleted = true; } catch { }
                   }
                 }
-                for (const outLine of tr.translate(line)) res.write(outLine);
+                writeTranslated(tr.translate(line));
               }
             });
 
@@ -2146,11 +2206,12 @@ function createServer() {
                     try { if (JSON.parse(payload)?.type === "response.completed") sawResponseCompleted = true; } catch { }
                   }
                 }
-                for (const outLine of tr.translate(pending)) res.write(outLine);
+                writeTranslated(tr.translate(pending));
                 pending = "";
               }
 
               if (tr.needsContinuation && !downstreamClosed && requestMeta.prepared?.body) {
+                attemptBuffer.length = 0;
                 diag("AUTO_CONTINUE: Executing follow-up request to force immediate tool call...");
                 tr.needsContinuation = false;
                 tr.allowAutoContinue = false;
@@ -2272,6 +2333,11 @@ function createServer() {
 
               clearInterval(heartbeatInterval);
               streamFinished = true;
+              attemptState.done = true;
+              if (!sawResponseCompleted && !responseCommitted) {
+                attemptBuffer.length = 0;
+                if (scheduleUpstreamRetry(attempt, `upstream_missing_completed_status_${ures.statusCode || 0}`)) return;
+              }
               upstreamFinished = true;
               if (!sawResponseCompleted) {
                 diag(`STREAM_END ERROR upstream_missing_completed status=${ures.statusCode || 0} done=${sawDoneMarker ? 1 : 0}`);
@@ -2288,16 +2354,26 @@ function createServer() {
           const rc = [];
           ures.on("data", c => rc.push(c));
           ures.on("aborted", () => {
+            if (attemptState.done) return;
+            attemptState.done = true;
+            const reason = `UPSTREAM_ABORT status=${ures.statusCode || 0} complete=${ures.complete ? 1 : 0}`;
+            if (scheduleUpstreamRetry(attempt, reason)) return;
             upstreamFinished = true;
-            diag(`UPSTREAM_ABORT status=${ures.statusCode || 0} complete=${ures.complete ? 1 : 0}`);
+            diag(`${reason} retries_exhausted=${attempt}`);
             if (!res.writableEnded && !res.destroyed) res.destroy();
           });
           ures.on("error", err => {
+            if (attemptState.done) return;
+            attemptState.done = true;
+            const reason = `UPSTREAM_RESPONSE_ERROR status=${ures.statusCode || 0} error=${err.message}`;
+            if (scheduleUpstreamRetry(attempt, reason)) return;
             upstreamFinished = true;
-            diag(`UPSTREAM_RESPONSE_ERROR status=${ures.statusCode || 0} error=${err.message}`);
+            diag(`${reason} retries_exhausted=${attempt}`);
             if (!res.writableEnded && !res.destroyed) res.destroy(err);
           });
           ures.on("end", () => {
+            if (attemptState.done) return;
+            attemptState.done = true;
             upstreamFinished = true;
             const raw = Buffer.concat(rc);
             let output = raw;
@@ -2352,29 +2428,36 @@ function createServer() {
             res.writeHead(ures.statusCode || 200, rh);
             res.end(output);
           });
-        });
+          });
+
+          ureq.on("error", err => {
+            if (attemptState.done || downstreamClosed) return;
+            attemptState.done = true;
+            const reason = `UPSTREAM_REQUEST_ERROR error=${err.message}`;
+            if (scheduleUpstreamRetry(attempt, reason)) return;
+            upstreamFinished = true;
+            diag(`${reason} retries_exhausted=${attempt}`);
+            if (!res.headersSent && !res.destroyed) sendJson(res, 502, {
+              error: "cannot connect to llama.cpp",
+              upstream: UPSTREAM.origin,
+              detail: err.message
+            });
+            else if (!res.writableEnded && !res.destroyed) res.end();
+          });
+
+          ureq.end(outbound);
+        };
+
+        startUpstreamAttempt(0);
 
         res.once("close", () => {
-          if (res.writableEnded || upstreamFinished) return;
+          if (res.writableEnded || upstreamFinished || responseCompletedForwarded) return;
           downstreamClosed = true;
+          if (retryTimer) clearTimeout(retryTimer);
           diag("DOWNSTREAM_CLOSE aborting_upstream=1");
           if (upstreamResponse && !upstreamResponse.destroyed) upstreamResponse.destroy();
-          if (!ureq.destroyed) ureq.destroy();
+          if (ureq && !ureq.destroyed) ureq.destroy();
         });
-
-        ureq.on("error", err => {
-          upstreamFinished = true;
-          if (downstreamClosed) return;
-          diag(`UPSTREAM_REQUEST_ERROR error=${err.message}`);
-          if (!res.headersSent && !res.destroyed) sendJson(res, 502, {
-            error: "cannot connect to llama.cpp",
-            upstream: UPSTREAM.origin,
-            detail: err.message
-          });
-          else if (!res.writableEnded && !res.destroyed) res.end();
-        });
-
-        ureq.end(outbound);
       } catch (err) {
         if (!res.headersSent) sendJson(res, 500, {
           error: "proxy error",

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "1.0.23"
+VERSION = "1.0.31"
 MARKER = "generated_by_codex_proxy_llama_cpp"
 
 
@@ -284,6 +284,9 @@ def proxy_environment(settings: Settings) -> dict[str, str]:
         "CODEX_FORWARD_TOOL_PROGRESS": "1",
         "CODEX_PROGRESS_MAX_CHARS": "1200",
         "CODEX_FORCE_SERIAL_TOOL_CALLS": "1",
+        "CODEX_UPSTREAM_RETRY_ATTEMPTS": "30",
+        "CODEX_UPSTREAM_RETRY_BASE_MS": "1000",
+        "CODEX_UPSTREAM_RETRY_MAX_MS": "10000",
         "CODEX_CHECKPOINT_DIR": str(settings.codex_home / "checkpoints"),
         "CODEX_MEMORY_ENABLED": "1",
         "CODEX_MEMORY_DIR": str(settings.codex_home / "memory"),
