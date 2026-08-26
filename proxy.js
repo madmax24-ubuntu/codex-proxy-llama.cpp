@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.31";
+const VERSION = "1.0.32";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -1255,7 +1255,7 @@ function prepareRequest(original) {
 
   const reasoningNormalization = normalizeReasoningEffort(body);
   const instructionNormalization = normalizeInstructionMessages(body);
-  const autonomyRule = "AUTONOMOUS EXECUTION PROTOCOL: You must work autonomously until the user's task or multi-step plan is 100% complete. If you just finished a sub-step (e.g. edited a file, applied a patch, or ran a tool), DO NOT stop with an explanation, plan summary, or progress message. You MUST immediately execute the next tool call. Before every git commit or push, run applicable syntax checks and tests; never publish code with a known validation failure. Only emit a final text message when ALL planned steps are fully implemented, verified, and pushed.";
+  const autonomyRule = "AUTONOMOUS EXECUTION PROTOCOL: You must work autonomously until the user's task or multi-step plan is 100% complete. If you just finished a sub-step (e.g. edited a file, applied a patch, or ran a tool), DO NOT stop with an explanation, plan summary, or progress message. You MUST immediately execute the next tool call. Before every git commit or push, run applicable syntax checks and tests; never publish code with a known validation failure. If any actionable work remains, including parked tasks, audits, tests, verification, builds, commits, or pushes, continue with a tool call instead of describing it as remaining work. Only emit a final text message when ALL planned steps are fully implemented, verified, and pushed.";
   if (typeof body.instructions === "string" && !body.instructions.includes("AUTONOMOUS EXECUTION PROTOCOL:")) {
     body.instructions = `${body.instructions.trim()}\n\n${autonomyRule}`;
   } else if (!body.instructions) {
@@ -1430,6 +1430,21 @@ function looksLikeTaskCompletion(text) {
     return true;
   }
   return false;
+}
+
+function hasExplicitRemainingWork(text) {
+  const t = String(text || "").trim();
+  if (!t) return false;
+  const lines = t.split(/\r?\n/);
+  const hasOpenSection = lines.some((line, index) => {
+    const match = line.match(/^\s*(?:#{1,6}\s*)?(?:open issues|next action|parked tasks)\s*:?\s*(.*)$/i);
+    if (!match) return false;
+    const value = match[1].trim() || lines.slice(index + 1).find(next => next.trim())?.trim() || "";
+    return !!value && !/^[-*]?\s*(?:none|нет)\.?$/i.test(value);
+  });
+  return hasOpenSection || /(?:^|\n)[^\n]{0,80}(?:остал(?:ось|ись)|ещ[её]\s+нужно|предстоит)[^\n]{0,240}(?:сделать|исправить|проверить|протестировать|реализовать|добавить|запустить|пройти|завершить|выполнить|собрать|опубликовать|аудит|тест|проверка|прогон|сборка|публикация)/im.test(t) ||
+    /(?:^|\n)[^\n]{0,80}\b(?:remaining (?:work|tasks?|steps?)|still need(?:s)? to|left to (?:do|fix|test|verify|implement|build|publish)|not yet (?:done|complete|tested|verified|implemented)|pending (?:work|tasks?|tests?|verification|audit))\b/im.test(t) ||
+    /(?:^|\n)\s*[-*]\s*\[ \]\s+\S/m.test(t);
 }
 
 function bufferedMessageEventId(encoded) {
@@ -1921,8 +1936,8 @@ class SseTranslator {
         const metrics = compactionTextMetrics(this.text);
         diag(`COMPACTION_SUMMARY accepted chars=${this.text.length} headings=${metrics.present} output_limit_hit=${Number((usage?.output_tokens || 0) >= COMPACT_MAX_OUTPUT_TOKENS)}`);
         updateCheckpointSummary(this.requestMeta.checkpointPath, this.text, usage);
-      } else if (!this.sawToolCall && (looksLikeProgressOnly(this.text) || !this.text.trim()) && this.allowAutoContinue && this.continuationDepth < 2) {
-        const reason = !this.text.trim() ? "empty-response" : "progress-only-no-tool";
+      } else if (!this.sawToolCall && (looksLikeProgressOnly(this.text) || hasExplicitRemainingWork(this.text) || !this.text.trim()) && this.allowAutoContinue && this.continuationDepth < 2) {
+        const reason = !this.text.trim() ? "empty-response" : hasExplicitRemainingWork(this.text) ? "explicit-remaining-work" : "progress-only-no-tool";
         diag(`TURN_GUARD AUTO_CONTINUE depth=${this.continuationDepth} reason=${reason} text=${JSON.stringify(this.text.slice(0, 200))}`);
         this.needsContinuation = true;
         this.sawCompletedForwarded = false;
@@ -2629,6 +2644,10 @@ function selftest() {
     !looksLikeDirectFileWrite('[System.IO.File]::WriteAllText("x.js", $code)') ||
     looksLikeDirectFileWrite('Get-Content x.js | Select-Object -First 20')) {
     throw new Error("direct file-write detection failed");
+  }
+  if (!hasExplicitRemainingWork("Баг найден и исправлен.\n\nОсталось по parked-списку: compliance-аудит и прогон тестов.") ||
+    hasExplicitRemainingWork("## OPEN ISSUES\n- Нет.\n\n## NEXT ACTION\n- Нет.")) {
+    throw new Error("explicit remaining-work detection failed");
   }
 
   function parseSseJsonEvents(chunks) {
