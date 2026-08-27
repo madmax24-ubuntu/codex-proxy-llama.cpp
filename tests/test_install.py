@@ -47,8 +47,9 @@ class InstallerTests(unittest.TestCase):
             root = Path(temp) / "codex-home"
             settings = self.settings(root)
             files = install.write_install(settings, False, False)
-            self.assertEqual(len(files), 8)
+            self.assertEqual(len(files), 9)
             self.assertTrue((root / "proxy.js").exists())
+            self.assertTrue((root / "mcp_supervisor.js").exists())
             config = (root / "config.toml").read_text(encoding="utf-8")
             self.assertIn("model_provider", config)
             self.assertIn("Interrupted. You are creating a CONTEXT CHECKPOINT SUMMARY", config)

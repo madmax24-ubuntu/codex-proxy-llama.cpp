@@ -173,6 +173,7 @@ The installer creates:
 
 - `config.toml`
 - `model_catalog.json`
+- `mcp_supervisor.js`
 - `proxy.js`
 - `env.cmd` and `env.sh`
 - `start-proxy.cmd` and `start-proxy.sh`
@@ -185,6 +186,23 @@ The installer creates:
 The proxy automatically remembers a completed task only when its history contains test or commit evidence. Memories are isolated by workspace, deduplicated, redacted before writing, and reused in later sessions only when their terms overlap the current request. At most three entries and 1200 characters are injected once per task; memory injection is suppressed after compaction and when the user reports that an earlier result regressed or failed.
 
 By default data is stored atomically in readable `memory/memory.json`, with a second `memory-backup.json` export. Set `CODEX_MEMORY_BACKEND=sqlite` to use the built-in `node:sqlite` backend on a Node.js version that provides it.
+
+## Resilient MCP servers
+
+`mcp_supervisor.js` keeps the Codex stdio transport alive when an MCP child process exits, restarts the child with bounded exponential backoff, performs a fresh MCP handshake, and preserves future tool calls. Interrupted read-only calls are retried once when the server advertises `readOnlyHint`; pass `--retry-inflight` only for servers whose calls are safe to repeat.
+
+```toml
+[mcp_servers.example]
+command = "node"
+args = ["/path/to/mcp_supervisor.js", "--", "node", "/path/to/server.js"]
+
+[mcp_servers.example.env]
+MCP_SUPERVISOR_NAME = "example"
+MCP_SUPERVISOR_LOG = "/path/to/mcp-example.log"
+MCP_SUPERVISOR_REQUEST_TIMEOUT_MS = "300000"
+```
+
+For a read-only server, add `"--retry-inflight"` before `"--"`. Prefer launching the installed server entry point directly instead of keeping `npx` in the long-running process chain.
 
 Inspect or remove entries:
 

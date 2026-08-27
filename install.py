@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "1.0.33"
+VERSION = "1.0.34"
 MARKER = "generated_by_codex_proxy_llama_cpp"
 
 
@@ -342,12 +342,16 @@ def backup(path: Path) -> Path:
 
 def write_install(settings: Settings, force: bool, dry_run: bool) -> list[Path]:
     source_proxy = Path(__file__).resolve().with_name("proxy.js")
+    source_mcp_supervisor = Path(__file__).resolve().with_name("mcp_supervisor.js")
     if not source_proxy.exists():
         raise FileNotFoundError(f"proxy.js not found next to installer: {source_proxy}")
+    if not source_mcp_supervisor.exists():
+        raise FileNotFoundError(f"mcp_supervisor.js not found next to installer: {source_mcp_supervisor}")
     files: dict[Path, str | bytes] = {
         settings.codex_home / "config.toml": render_config(settings),
         settings.codex_home / "model_catalog.json": render_catalog(settings),
         settings.codex_home / "proxy.js": source_proxy.read_bytes(),
+        settings.codex_home / "mcp_supervisor.js": source_mcp_supervisor.read_bytes(),
         settings.codex_home / "env.cmd": render_env_cmd(settings),
         settings.codex_home / "env.sh": render_env_sh(settings),
         settings.codex_home / "start-proxy.cmd": render_start_cmd(settings),
