@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "1.0.34"
+VERSION = "1.0.35"
 MARKER = "generated_by_codex_proxy_llama_cpp"
 
 
@@ -278,6 +278,7 @@ def proxy_environment(settings: Settings) -> dict[str, str]:
         "CODEX_REASONING_BUDGET_XHIGH": str(settings.reasoning_budgets["xhigh"]),
         "CODEX_COMPACT_MAX_OUTPUT_TOKENS": "4096",
         "CODEX_COMPACT_REASONING_BUDGET": "0",
+        "CODEX_COMPACT_TASK_ANCHOR_MAX_CHARS": "8000",
         "CODEX_POST_COMPACT_OLD_USER_TOKEN_LIMIT": "0",
         "CODEX_POST_COMPACT_TOOL_OUTPUT_MAX_CHARS": "4000",
         "CODEX_POST_COMPACT_TOOL_OUTPUT_KEEP_RECENT": "2",

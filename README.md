@@ -17,7 +17,7 @@ Codex expects more than basic OpenAI-compatible chat completions. Agentic sessio
 - Function/custom tool history replay across turns.
 - Correct SSE event framing, completion usage normalization, abort propagation, and broken-stream diagnostics.
 - Tool-step chatter suppression without hiding the final assistant answer.
-- Structured compaction that recovers valid checkpoints from reasoning-only llama.cpp responses, suppresses compaction reasoning from the UI, and keeps full cold checkpoints.
+- Structured compaction that deterministically preserves the active user request and plan, repairs stale or reasoning-only checkpoints, suppresses compaction reasoning from the UI, and keeps full cold checkpoints.
 - Fresh-tail recovery metadata instead of silently reusing a stale checkpoint when compaction output is invalid.
 - Persistent project-scoped episodic memory with evidence-gated writes, relevance retrieval, secret redaction, and a bounded prompt footprint.
 - Pre-commit validation instructions for agentic sessions.
@@ -229,6 +229,7 @@ node proxy.js --memory-forget MEMORY_ID
 | `CODEX_UPSTREAM_RETRY_MAX_MS` | Maximum reconnect delay | `10000` |
 | `CODEX_UPSTREAM_IDLE_TIMEOUT_MS` | Reconnect when upstream sends no data for this interval | `300000` |
 | `CODEX_COMPACT_MAX_OUTPUT_TOKENS` | Compaction output cap | `4096` |
+| `CODEX_COMPACT_TASK_ANCHOR_MAX_CHARS` | Maximum authoritative active-task text preserved in every checkpoint | `8000` |
 | `CODEX_POST_COMPACT_OLD_USER_TOKEN_LIMIT` | Token budget for superseded user requests kept after compaction | `0` |
 | `CODEX_POST_COMPACT_TOOL_OUTPUT_MAX_CHARS` | Maximum retained characters in each older tool output after compaction | `4000` |
 | `CODEX_POST_COMPACT_TOOL_OUTPUT_KEEP_RECENT` | Recent tool outputs kept in full after compaction | `2` |
