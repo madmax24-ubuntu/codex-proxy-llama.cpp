@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.32";
+const VERSION = "1.0.33";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -60,6 +60,7 @@ const FORCE_SERIAL_TOOL_CALLS = !/^(0|false|no)$/i.test(process.env.CODEX_FORCE_
 const UPSTREAM_RETRY_ATTEMPTS = Math.max(0, Math.min(60, Number(process.env.CODEX_UPSTREAM_RETRY_ATTEMPTS || "30") || 30));
 const UPSTREAM_RETRY_BASE_MS = Math.max(100, Number(process.env.CODEX_UPSTREAM_RETRY_BASE_MS || "1000") || 1000);
 const UPSTREAM_RETRY_MAX_MS = Math.max(UPSTREAM_RETRY_BASE_MS, Number(process.env.CODEX_UPSTREAM_RETRY_MAX_MS || "10000") || 10000);
+const UPSTREAM_IDLE_TIMEOUT_MS = Math.max(100, Number(process.env.CODEX_UPSTREAM_IDLE_TIMEOUT_MS || "300000") || 300000);
 const CHECKPOINT_DIR = process.env.CODEX_CHECKPOINT_DIR || path.join(__dirname, "checkpoints");
 const MEMORY_DIR = process.env.CODEX_MEMORY_DIR || path.join(__dirname, "memory");
 const MEMORY_MAX_ITEMS = Math.max(1, Math.min(4, Number(process.env.CODEX_MEMORY_MAX_ITEMS || "1") || 1));
@@ -2177,7 +2178,7 @@ function createServer() {
 
             const finishBrokenStream = reason => {
               clearInterval(heartbeatInterval);
-              if (streamFinished) return;
+              if (streamFinished || attemptState.done) return;
               streamFinished = true;
               attemptState.done = true;
               attemptBuffer.length = 0;
@@ -2448,7 +2449,7 @@ function createServer() {
           ureq.on("error", err => {
             if (attemptState.done || downstreamClosed) return;
             attemptState.done = true;
-            const reason = `UPSTREAM_REQUEST_ERROR error=${err.message}`;
+            const reason = attemptState.timeoutReason || `UPSTREAM_REQUEST_ERROR error=${err.message}`;
             if (scheduleUpstreamRetry(attempt, reason)) return;
             upstreamFinished = true;
             diag(`${reason} retries_exhausted=${attempt}`);
@@ -2458,6 +2459,13 @@ function createServer() {
               detail: err.message
             });
             else if (!res.writableEnded && !res.destroyed) res.end();
+          });
+
+          ureq.setTimeout(UPSTREAM_IDLE_TIMEOUT_MS, () => {
+            if (attemptState.done || downstreamClosed) return;
+            attemptState.timeoutReason = `UPSTREAM_IDLE_TIMEOUT idle_ms=${UPSTREAM_IDLE_TIMEOUT_MS}`;
+            diag(`${attemptState.timeoutReason} attempt=${attempt + 1}`);
+            ureq.destroy(new Error(attemptState.timeoutReason));
           });
 
           ureq.end(outbound);

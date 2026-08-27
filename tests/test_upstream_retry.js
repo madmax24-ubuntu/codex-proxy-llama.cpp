@@ -61,6 +61,7 @@ async function main() {
   let attempts = 0;
   let committedAttempts = 0;
   let unfinishedAttempts = 0;
+  let stalledAttempts = 0;
   let mode = "recover";
   const upstream = http.createServer((req, res) => {
     if (req.url === "/health") {
@@ -69,6 +70,25 @@ async function main() {
       return;
     }
     req.resume();
+    if (mode === "stalled") {
+      stalledAttempts++;
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      if (stalledAttempts === 1) {
+        res.write('data: {"type":"response.created","response":{"id":"resp_stalled","status":"in_progress","output":[]}}\n\n');
+        return;
+      }
+      const text = "STALL_RECOVERED";
+      const events = [
+        { type: "response.created", response: { id: "resp_stall_retry", status: "in_progress", output: [] } },
+        { type: "response.output_item.added", output_index: 0, item: { id: "msg_stall_retry", type: "message", status: "in_progress", role: "assistant", content: [] } },
+        { type: "response.output_text.delta", item_id: "msg_stall_retry", output_index: 0, content_index: 0, delta: text },
+        { type: "response.output_item.done", output_index: 0, item: { id: "msg_stall_retry", type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text, annotations: [] }] } },
+        { type: "response.completed", response: { id: "resp_stall_retry", status: "completed", output: [{ id: "msg_stall_retry", type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text, annotations: [] }] }], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } }
+      ];
+      for (const event of events) res.write(`data: ${JSON.stringify(event)}\n\n`);
+      res.end("data: [DONE]\n\n");
+      return;
+    }
     if (mode === "unfinished") {
       unfinishedAttempts++;
       res.writeHead(200, { "content-type": "text/event-stream" });
@@ -138,6 +158,7 @@ async function main() {
       CODEX_UPSTREAM_RETRY_ATTEMPTS: "3",
       CODEX_UPSTREAM_RETRY_BASE_MS: "50",
       CODEX_UPSTREAM_RETRY_MAX_MS: "100",
+      CODEX_UPSTREAM_IDLE_TIMEOUT_MS: "200",
       CODEX_MEMORY_ENABLED: "0"
     },
     stdio: ["ignore", "pipe", "pipe"]
@@ -168,6 +189,12 @@ async function main() {
     assert.doesNotMatch(unfinished.text, /msg_unfinished/);
     assert.strictEqual((unfinished.text.match(/"type":"response.completed"/g) || []).length, 1);
     assert.match(fs.readFileSync(diagPath, "utf8"), /TURN_GUARD AUTO_CONTINUE depth=0 reason=explicit-remaining-work/);
+    mode = "stalled";
+    const stalled = await post(proxyPort, { model: "llm", input: "stall", stream: true, reasoning: { effort: "low" } });
+    assert.strictEqual(stalledAttempts, 2);
+    assert.match(stalled.text, /STALL_RECOVERED/);
+    assert.doesNotMatch(stalled.text, /resp_stalled/);
+    assert.match(fs.readFileSync(diagPath, "utf8"), /UPSTREAM_IDLE_TIMEOUT idle_ms=200/);
     process.stdout.write("UPSTREAM RETRY TEST PASS\n");
   } finally {
     child.kill();

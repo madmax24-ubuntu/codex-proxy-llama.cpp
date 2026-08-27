@@ -37,6 +37,11 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("Before every commit or push", model["base_instructions"])
         self.assertIn("dedicated apply_patch tool", model["base_instructions"])
 
+    def test_proxy_environment_has_stall_recovery(self):
+        with tempfile.TemporaryDirectory() as temp:
+            environment = install.proxy_environment(self.settings(Path(temp)))
+        self.assertEqual(environment["CODEX_UPSTREAM_IDLE_TIMEOUT_MS"], "300000")
+
     def test_install_and_backup(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "codex-home"

@@ -209,6 +209,7 @@ node proxy.js --memory-forget MEMORY_ID
 | `CODEX_UPSTREAM_RETRY_ATTEMPTS` | Reconnect attempts before an uncommitted response fails | `30` |
 | `CODEX_UPSTREAM_RETRY_BASE_MS` | Initial reconnect delay | `1000` |
 | `CODEX_UPSTREAM_RETRY_MAX_MS` | Maximum reconnect delay | `10000` |
+| `CODEX_UPSTREAM_IDLE_TIMEOUT_MS` | Reconnect when upstream sends no data for this interval | `300000` |
 | `CODEX_COMPACT_MAX_OUTPUT_TOKENS` | Compaction output cap | `4096` |
 | `CODEX_POST_COMPACT_OLD_USER_TOKEN_LIMIT` | Token budget for superseded user requests kept after compaction | `0` |
 | `CODEX_POST_COMPACT_TOOL_OUTPUT_MAX_CHARS` | Maximum retained characters in each older tool output after compaction | `4000` |
