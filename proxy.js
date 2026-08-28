@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.35";
+const VERSION = "1.0.36";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -1555,6 +1555,25 @@ function hasExplicitRemainingWork(text) {
     /(?:^|\n)\s*[-*]\s*\[ \]\s+\S/m.test(t);
 }
 
+function hasMalformedToolMarkup(text) {
+  const source = String(text || "");
+  const pattern = /<\s*(\/?)\s*(tool_call|function)(?:\s*=[^>]*)?\s*>/gi;
+  const balance = { tool_call: 0, function: 0 };
+  let found = false;
+  let malformed = false;
+  for (const match of source.matchAll(pattern)) {
+    found = true;
+    const name = match[2].toLowerCase();
+    if (match[1]) {
+      balance[name]--;
+      if (balance[name] < 0) malformed = true;
+    } else {
+      balance[name]++;
+    }
+  }
+  return found && (malformed || balance.tool_call !== 0 || balance.function !== 0);
+}
+
 function bufferedMessageEventId(encoded) {
   try {
     const event = JSON.parse(String(encoded).replace(/^data:\s*/, "").trim());
@@ -1787,6 +1806,7 @@ class SseTranslator {
     this.bufferedMessageEvents = [];
     this.allowAutoContinue = requestMeta.allowAutoContinue === true;
     this.needsContinuation = false;
+    this.continuationReason = null;
     this.continuationDepth = requestMeta.continuationDepth || 0;
   }
 
@@ -2039,10 +2059,11 @@ class SseTranslator {
         const metrics = compactionTextMetrics(this.text);
         diag(`COMPACTION_SUMMARY accepted chars=${this.text.length} headings=${metrics.present} output_limit_hit=${Number((usage?.output_tokens || 0) >= COMPACT_MAX_OUTPUT_TOKENS)}`);
         updateCheckpointSummary(this.requestMeta.checkpointPath, this.text, usage);
-      } else if (!this.sawToolCall && (looksLikeProgressOnly(this.text) || hasExplicitRemainingWork(this.text) || !this.text.trim()) && this.allowAutoContinue && this.continuationDepth < 2) {
-        const reason = !this.text.trim() ? "empty-response" : hasExplicitRemainingWork(this.text) ? "explicit-remaining-work" : "progress-only-no-tool";
+      } else if (!this.sawToolCall && (hasMalformedToolMarkup(this.text) || looksLikeProgressOnly(this.text) || hasExplicitRemainingWork(this.text) || !this.text.trim()) && this.allowAutoContinue && this.continuationDepth < 2) {
+        const reason = hasMalformedToolMarkup(this.text) ? "malformed-tool-markup" : !this.text.trim() ? "empty-response" : hasExplicitRemainingWork(this.text) ? "explicit-remaining-work" : "progress-only-no-tool";
         diag(`TURN_GUARD AUTO_CONTINUE depth=${this.continuationDepth} reason=${reason} text=${JSON.stringify(this.text.slice(0, 200))}`);
         this.needsContinuation = true;
+        this.continuationReason = reason;
         this.sawCompletedForwarded = false;
         return [];
       } else if (!this.sawToolCall) {
@@ -2336,8 +2357,10 @@ function createServer() {
                 tr.allowAutoContinue = false;
 
                 const followUpBody = clone(requestMeta.prepared.body);
+                if (Array.isArray(followUpBody.tools) && followUpBody.tools.length) followUpBody.tool_choice = "required";
                 if (Array.isArray(followUpBody.input)) {
-                  followUpBody.input.push({
+                  const malformedToolMarkup = tr.continuationReason === "malformed-tool-markup";
+                  if (!malformedToolMarkup) followUpBody.input.push({
                     type: "message",
                     role: "assistant",
                     content: [{ type: "output_text", text: tr.text }]
@@ -2345,7 +2368,9 @@ function createServer() {
                   followUpBody.input.push({
                     type: "message",
                     role: "user",
-                    content: [{ type: "input_text", text: tr.text.trim()
+                    content: [{ type: "input_text", text: malformedToolMarkup
+                      ? "[SYSTEM: The previous generation ended in malformed tool markup and was discarded. The active user task is NOT complete. Ignore that corrupted output and immediately invoke the appropriate tool to continue the existing task. Do not answer with text.]"
+                      : tr.text.trim()
                       ? "[SYSTEM: You sent a text message but no tool call. Your task is NOT complete. You MUST immediately invoke the appropriate tool now — do not explain, just call the tool.]"
                       : "[SYSTEM: Empty response detected. Your task is NOT complete. You MUST immediately invoke a tool to continue. Do not write text — call the tool now.]"
                     }]
@@ -2389,9 +2414,13 @@ function createServer() {
                       diag(`AUTO_CONTINUE: depth=${followUpTr.continuationDepth} chaining another follow-up...`);
                       followUpTr.needsContinuation = false;
                       const chainBody = clone(requestMeta.prepared.body);
+                      if (Array.isArray(chainBody.tools) && chainBody.tools.length) chainBody.tool_choice = "required";
                       if (Array.isArray(chainBody.input)) {
-                        chainBody.input.push({ type: "message", role: "assistant", content: [{ type: "output_text", text: followUpTr.text || tr.text }] });
-                        chainBody.input.push({ type: "message", role: "user", content: [{ type: "input_text", text: "[SYSTEM: Still no tool call. Task is not done. Call a tool NOW. Do not write text.]" }] });
+                        const malformedToolMarkup = followUpTr.continuationReason === "malformed-tool-markup";
+                        if (!malformedToolMarkup) chainBody.input.push({ type: "message", role: "assistant", content: [{ type: "output_text", text: followUpTr.text || tr.text }] });
+                        chainBody.input.push({ type: "message", role: "user", content: [{ type: "input_text", text: malformedToolMarkup
+                          ? "[SYSTEM: Another malformed tool fragment was discarded. The active task remains unfinished. Invoke the appropriate tool now and emit no text.]"
+                          : "[SYSTEM: Still no tool call. Task is not done. Call a tool NOW. Do not write text.]" }] });
                       }
                       const chainOutbound = Buffer.from(JSON.stringify(chainBody));
                       const chainHeaders = copyHeaders(req.headers);
@@ -3002,6 +3031,27 @@ function selftest() {
     finalMessageCompleted[1]?.type !== "response.output_text.delta" ||
     finalMessageCompleted[2]?.type !== "response.completed") {
     throw new Error("final assistant message buffering failed");
+  }
+
+  const malformedToolTail = new SseTranslator(p.maps, { allowAutoContinue: true });
+  malformedToolTail.translate("data: " + JSON.stringify({
+    type: "response.output_item.added",
+    output_index: 0,
+    item: { id: "msg_malformed_tool", type: "message", role: "assistant", content: [] }
+  }));
+  malformedToolTail.translate("data: " + JSON.stringify({
+    type: "response.output_text.delta",
+    item_id: "msg_malformed_tool",
+    output_index: 0,
+    content_index: 0,
+    delta: "</function>\n</tool_call>"
+  }));
+  const malformedToolCompleted = malformedToolTail.translate("data: " + JSON.stringify({
+    type: "response.completed",
+    response: { id: "resp_malformed_tool", status: "completed", output: [] }
+  }));
+  if (malformedToolCompleted.length || !malformedToolTail.needsContinuation) {
+    throw new Error("malformed tool tail was accepted as task completion");
   }
 
   const validCheckpoint = [

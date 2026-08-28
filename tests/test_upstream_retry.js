@@ -61,6 +61,7 @@ async function main() {
   let attempts = 0;
   let committedAttempts = 0;
   let unfinishedAttempts = 0;
+  let malformedAttempts = 0;
   let stalledAttempts = 0;
   let mode = "recover";
   const upstream = http.createServer((req, res) => {
@@ -110,6 +111,32 @@ async function main() {
         { type: "response.output_item.added", output_index: 0, item: { id: "fc_continued", call_id: "call_continued", type: "function_call", name: "shell_command", arguments: "" } },
         { type: "response.output_item.done", output_index: 0, item: { id: "fc_continued", call_id: "call_continued", type: "function_call", name: "shell_command", arguments: "{\"command\":\"npm test\"}" } },
         { type: "response.completed", response: { id: "resp_continued", status: "completed", output: [{ id: "fc_continued", call_id: "call_continued", type: "function_call", name: "shell_command", arguments: "{\"command\":\"npm test\"}" }], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } }
+      ];
+      for (const event of events) res.write(`data: ${JSON.stringify(event)}\n\n`);
+      res.end("data: [DONE]\n\n");
+      return;
+    }
+    if (mode === "malformed") {
+      malformedAttempts++;
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      if (malformedAttempts === 1) {
+        const text = "</function>\n</tool_call>";
+        const events = [
+          { type: "response.created", response: { id: "resp_malformed", status: "in_progress", output: [] } },
+          { type: "response.output_item.added", output_index: 0, item: { id: "msg_malformed", type: "message", status: "in_progress", role: "assistant", content: [] } },
+          { type: "response.output_text.delta", item_id: "msg_malformed", output_index: 0, content_index: 0, delta: text },
+          { type: "response.output_item.done", output_index: 0, item: { id: "msg_malformed", type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text, annotations: [] }] } },
+          { type: "response.completed", response: { id: "resp_malformed", status: "completed", output: [{ id: "msg_malformed", type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text, annotations: [] }] }], usage: { input_tokens: 1, output_tokens: 2, total_tokens: 3 } } }
+        ];
+        for (const event of events) res.write(`data: ${JSON.stringify(event)}\n\n`);
+        res.end("data: [DONE]\n\n");
+        return;
+      }
+      const events = [
+        { type: "response.created", response: { id: "resp_malformed_recovered", status: "in_progress", output: [] } },
+        { type: "response.output_item.added", output_index: 0, item: { id: "fc_malformed_recovered", call_id: "call_malformed_recovered", type: "function_call", name: "shell_command", arguments: "" } },
+        { type: "response.output_item.done", output_index: 0, item: { id: "fc_malformed_recovered", call_id: "call_malformed_recovered", type: "function_call", name: "shell_command", arguments: "{\"command\":\"npm test\"}" } },
+        { type: "response.completed", response: { id: "resp_malformed_recovered", status: "completed", output: [{ id: "fc_malformed_recovered", call_id: "call_malformed_recovered", type: "function_call", name: "shell_command", arguments: "{\"command\":\"npm test\"}" }], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } }
       ];
       for (const event of events) res.write(`data: ${JSON.stringify(event)}\n\n`);
       res.end("data: [DONE]\n\n");
@@ -189,6 +216,13 @@ async function main() {
     assert.doesNotMatch(unfinished.text, /msg_unfinished/);
     assert.strictEqual((unfinished.text.match(/"type":"response.completed"/g) || []).length, 1);
     assert.match(fs.readFileSync(diagPath, "utf8"), /TURN_GUARD AUTO_CONTINUE depth=0 reason=explicit-remaining-work/);
+    mode = "malformed";
+    const malformed = await post(proxyPort, { model: "llm", input: "continue the active task", stream: true, reasoning: { effort: "low" } });
+    assert.strictEqual(malformedAttempts, 2);
+    assert.match(malformed.text, /fc_malformed_recovered/);
+    assert.doesNotMatch(malformed.text, /msg_malformed/);
+    assert.strictEqual((malformed.text.match(/"type":"response.completed"/g) || []).length, 1);
+    assert.match(fs.readFileSync(diagPath, "utf8"), /TURN_GUARD AUTO_CONTINUE depth=0 reason=malformed-tool-markup/);
     mode = "stalled";
     const stalled = await post(proxyPort, { model: "llm", input: "stall", stream: true, reasoning: { effort: "low" } });
     assert.strictEqual(stalledAttempts, 2);
