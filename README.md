@@ -228,6 +228,7 @@ node proxy.js --memory-forget MEMORY_ID
 | `CODEX_UPSTREAM_RETRY_BASE_MS` | Initial reconnect delay | `1000` |
 | `CODEX_UPSTREAM_RETRY_MAX_MS` | Maximum reconnect delay | `10000` |
 | `CODEX_UPSTREAM_IDLE_TIMEOUT_MS` | Reconnect when upstream sends no data for this interval | `300000` |
+| `CODEX_DOWNSTREAM_HEARTBEAT_MS` | Emit Responses events while llama.cpp is still processing | `30000` |
 | `CODEX_COMPACT_MAX_OUTPUT_TOKENS` | Compaction output cap | `4096` |
 | `CODEX_COMPACT_TASK_ANCHOR_MAX_CHARS` | Maximum authoritative active-task text preserved in every checkpoint | `8000` |
 | `CODEX_POST_COMPACT_OLD_USER_TOKEN_LIMIT` | Token budget for superseded user requests kept after compaction | `0` |

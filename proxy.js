@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.36";
+const VERSION = "1.0.37";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -62,6 +62,7 @@ const UPSTREAM_RETRY_ATTEMPTS = Math.max(0, Math.min(60, Number(process.env.CODE
 const UPSTREAM_RETRY_BASE_MS = Math.max(100, Number(process.env.CODEX_UPSTREAM_RETRY_BASE_MS || "1000") || 1000);
 const UPSTREAM_RETRY_MAX_MS = Math.max(UPSTREAM_RETRY_BASE_MS, Number(process.env.CODEX_UPSTREAM_RETRY_MAX_MS || "10000") || 10000);
 const UPSTREAM_IDLE_TIMEOUT_MS = Math.max(100, Number(process.env.CODEX_UPSTREAM_IDLE_TIMEOUT_MS || "300000") || 300000);
+const DOWNSTREAM_HEARTBEAT_MS = Math.max(50, Number(process.env.CODEX_DOWNSTREAM_HEARTBEAT_MS || "30000") || 30000);
 const CHECKPOINT_DIR = process.env.CODEX_CHECKPOINT_DIR || path.join(__dirname, "checkpoints");
 const MEMORY_DIR = process.env.CODEX_MEMORY_DIR || path.join(__dirname, "memory");
 const MEMORY_MAX_ITEMS = Math.max(1, Math.min(4, Number(process.env.CODEX_MEMORY_MAX_ITEMS || "1") || 1));
@@ -1808,6 +1809,32 @@ class SseTranslator {
     this.needsContinuation = false;
     this.continuationReason = null;
     this.continuationDepth = requestMeta.continuationDepth || 0;
+    this.transportResponseId = requestMeta.transportResponseId || `resp_proxy_${crypto.randomBytes(12).toString("hex")}`;
+    this.requestMeta.transportResponseId = this.transportResponseId;
+    this.transportCreatedAt = requestMeta.transportCreatedAt || Math.floor(Date.now() / 1000);
+    this.requestMeta.transportCreatedAt = this.transportCreatedAt;
+    this.heartbeatCreatedForwarded = false;
+  }
+
+  heartbeatEvents() {
+    if (this.sawCompletedForwarded) return [];
+    const response = {
+      id: this.transportResponseId,
+      object: "response",
+      created_at: this.transportCreatedAt,
+      status: "in_progress",
+      error: null,
+      incomplete_details: null,
+      model: this.requestMeta.prepared?.body?.model || "llm",
+      output: []
+    };
+    const events = [];
+    if (!this.heartbeatCreatedForwarded) {
+      this.heartbeatCreatedForwarded = true;
+      events.push(this.event({ type: "response.created", response }));
+    }
+    events.push(this.event({ type: "response.in_progress", response }));
+    return events;
   }
 
   recoveredCompactionEvents(evt, text) {
@@ -1906,6 +1933,12 @@ class SseTranslator {
     }
 
     this.normalizeEventShape(evt);
+
+    if (this.heartbeatCreatedForwarded) {
+      if (evt.response && typeof evt.response === "object") evt.response.id = this.transportResponseId;
+      if (evt.response_id) evt.response_id = this.transportResponseId;
+      if (evt.type === "response.created") return [];
+    }
 
     if (this.requestMeta.isCompaction && isReasoningStreamEvent(evt)) {
       if (typeof evt.delta === "string" && evt.type?.endsWith(".delta")) this.reasoningText += evt.delta;
@@ -2216,6 +2249,26 @@ function createServer() {
         let responseCompletedForwarded = false;
         let retryTimer = null;
         let ureq = null;
+        let activeHeartbeatTranslator = new SseTranslator(maps, requestMeta);
+        let heartbeatStarted = false;
+        let heartbeatCount = 0;
+        const heartbeatInterval = requestMeta.prepared?.body?.stream === true ? setInterval(() => {
+          if (upstreamFinished || res.writableEnded || res.destroyed) {
+            clearInterval(heartbeatInterval);
+            return;
+          }
+          try {
+            if (!res.headersSent) res.writeHead(200, {
+              "content-type": "text/event-stream",
+              "cache-control": "no-cache",
+              "connection": "close"
+            });
+            for (const heartbeat of activeHeartbeatTranslator.heartbeatEvents()) res.write(heartbeat);
+            heartbeatStarted = true;
+            heartbeatCount++;
+            if (heartbeatCount === 1 || heartbeatCount % 10 === 0) diag(`DOWNSTREAM_HEARTBEAT count=${heartbeatCount}`);
+          } catch {}
+        }, DOWNSTREAM_HEARTBEAT_MS) : null;
         const retryDelay = attempt => Math.min(UPSTREAM_RETRY_MAX_MS, UPSTREAM_RETRY_BASE_MS * (2 ** Math.min(attempt, 4)));
         const retryableStatus = status => status === 408 || status === 409 || status === 429 || status >= 500;
         const scheduleUpstreamRetry = (attempt, reason) => {
@@ -2255,6 +2308,8 @@ function createServer() {
             if (!res.headersSent) res.writeHead(ures.statusCode || 200, rh);
 
             const tr = new SseTranslator(maps, requestMeta);
+            tr.heartbeatCreatedForwarded = heartbeatStarted;
+            activeHeartbeatTranslator = tr;
             ures.setEncoding("utf8");
             let pending = "";
             let sawResponseCompleted = false;
@@ -2291,14 +2346,6 @@ function createServer() {
               for (const line of attemptBuffer) res.write(line);
               attemptBuffer.length = 0;
             };
-
-            const heartbeatInterval = setInterval(() => {
-              if (streamFinished || res.writableEnded || res.destroyed) {
-                clearInterval(heartbeatInterval);
-                return;
-              }
-              try { res.write(":\n\n"); } catch {}
-            }, 5000);
 
             const finishBrokenStream = reason => {
               clearInterval(heartbeatInterval);
@@ -2387,6 +2434,8 @@ function createServer() {
                   allowAutoContinue: true,
                   continuationDepth: (requestMeta.continuationDepth || 0) + 1
                 });
+                followUpTr.heartbeatCreatedForwarded = heartbeatStarted;
+                activeHeartbeatTranslator = followUpTr;
                 const followUpReq = transport.request({
                   protocol: UPSTREAM.protocol,
                   hostname: UPSTREAM.hostname,
@@ -2428,6 +2477,8 @@ function createServer() {
                       chainHeaders["accept-encoding"] = "identity";
                       chainHeaders["connection"] = "close";
                       const chainTr = new SseTranslator(maps, { ...requestMeta, allowAutoContinue: false, continuationDepth: followUpTr.continuationDepth });
+                      chainTr.heartbeatCreatedForwarded = heartbeatStarted;
+                      activeHeartbeatTranslator = chainTr;
                       const chainReq = transport.request({ protocol: UPSTREAM.protocol, hostname: UPSTREAM.hostname, port: UPSTREAM.port || (UPSTREAM.protocol === "https:" ? 443 : 80), method: req.method, path: req.url, headers: chainHeaders }, chainRes => {
                         chainRes.setEncoding("utf8");
                         let cPending = "";

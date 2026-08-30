@@ -41,6 +41,7 @@ class InstallerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             environment = install.proxy_environment(self.settings(Path(temp)))
         self.assertEqual(environment["CODEX_UPSTREAM_IDLE_TIMEOUT_MS"], "300000")
+        self.assertEqual(environment["CODEX_DOWNSTREAM_HEARTBEAT_MS"], "30000")
 
     def test_install_and_backup(self):
         with tempfile.TemporaryDirectory() as temp:
