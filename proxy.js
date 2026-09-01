@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.37";
+const VERSION = "1.0.38";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -63,6 +63,7 @@ const UPSTREAM_RETRY_BASE_MS = Math.max(100, Number(process.env.CODEX_UPSTREAM_R
 const UPSTREAM_RETRY_MAX_MS = Math.max(UPSTREAM_RETRY_BASE_MS, Number(process.env.CODEX_UPSTREAM_RETRY_MAX_MS || "10000") || 10000);
 const UPSTREAM_IDLE_TIMEOUT_MS = Math.max(100, Number(process.env.CODEX_UPSTREAM_IDLE_TIMEOUT_MS || "300000") || 300000);
 const DOWNSTREAM_HEARTBEAT_MS = Math.max(50, Number(process.env.CODEX_DOWNSTREAM_HEARTBEAT_MS || "30000") || 30000);
+const REPEAT_GUARD_THRESHOLD = Math.max(2, Math.min(10, Number(process.env.CODEX_REPEAT_GUARD_THRESHOLD || "3") || 3));
 const CHECKPOINT_DIR = process.env.CODEX_CHECKPOINT_DIR || path.join(__dirname, "checkpoints");
 const MEMORY_DIR = process.env.CODEX_MEMORY_DIR || path.join(__dirname, "memory");
 const MEMORY_MAX_ITEMS = Math.max(1, Math.min(4, Number(process.env.CODEX_MEMORY_MAX_ITEMS || "1") || 1));
@@ -711,6 +712,103 @@ function shellCommandText(args) {
   return args;
 }
 
+function canonicalToolArgs(value) {
+  let parsed = value;
+  if (typeof value === "string") {
+    try { parsed = JSON.parse(value); } catch { return value.trim(); }
+  }
+  const normalize = item => {
+    if (Array.isArray(item)) return item.map(normalize);
+    if (!item || typeof item !== "object") return item;
+    return Object.fromEntries(Object.keys(item).sort().map(key => [key, normalize(item[key])]));
+  };
+  try { return JSON.stringify(normalize(parsed)); } catch { return String(value || "").trim(); }
+}
+
+function toolCallIdentity(item) {
+  if (!item || (item.type !== "function_call" && item.type !== "custom_tool_call")) return null;
+  const namespace = typeof item.namespace === "string" && item.namespace ? `${item.namespace}::` : "";
+  const name = `${namespace}${String(item.name || "unknown")}`;
+  const args = item.type === "custom_tool_call" ? item.input : item.arguments;
+  return { name, signature: `${name}\n${canonicalToolArgs(args)}` };
+}
+
+function toolOutputText(item) {
+  const value = item?.output;
+  if (typeof value === "string") return value;
+  if (!Array.isArray(value)) {
+    try { return JSON.stringify(value ?? ""); } catch { return String(value ?? ""); }
+  }
+  return value.map(block => {
+    if (typeof block === "string") return block;
+    if (typeof block?.text === "string") return block.text;
+    if (typeof block?.content === "string") return block.content;
+    try { return JSON.stringify(block); } catch { return ""; }
+  }).join("\n");
+}
+
+function canonicalToolOutcome(item) {
+  return toolOutputText(item)
+    .replace(/\bChunk ID:\s*\S+/gi, "Chunk ID: <volatile>")
+    .replace(/\bWall time:\s*[\d.]+\s*seconds?/gi, "Wall time: <volatile>")
+    .replace(/\bcall_[A-Za-z0-9_-]+\b/g, "call_<volatile>")
+    .replace(/\[AUTONOMOUS EXECUTION DIRECTIVE:[\s\S]*?\]\s*$/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isPollingToolCall(identity) {
+  if (!identity) return false;
+  if (/(?:^|::)(?:wait|write_stdin|wait_agent|bridge_status|health|status)$/i.test(identity.name)) return true;
+  return /\b(?:Start-Sleep|sleep|timeout)\b|Get-Content\s+[^\r\n]*-Wait\b|\btail\s+-f\b/i.test(identity.signature);
+}
+
+function repeatedToolCallRecovery(body, threshold = REPEAT_GUARD_THRESHOLD) {
+  if (!Array.isArray(body?.input)) return null;
+  const pending = new Map();
+  let lastSignature = "";
+  let lastOutcome = "";
+  let count = 0;
+  let latest = null;
+  for (const item of body.input) {
+    if (!item || typeof item !== "object") continue;
+    if ((item.role === "user" || item.type === "input_text") && item.type !== "function_call_output" && item.type !== "custom_tool_call_output") {
+      lastSignature = "";
+      lastOutcome = "";
+      count = 0;
+      latest = null;
+      continue;
+    }
+    const identity = toolCallIdentity(item);
+    if (identity) {
+      const id = item.call_id || item.id;
+      if (id) pending.set(id, identity);
+      continue;
+    }
+    if (item.type !== "function_call_output" && item.type !== "custom_tool_call_output") continue;
+    const identityForOutput = pending.get(item.call_id || item.id);
+    if (!identityForOutput || isPollingToolCall(identityForOutput)) {
+      lastSignature = "";
+      lastOutcome = "";
+      count = 0;
+      latest = null;
+      continue;
+    }
+    const outcome = canonicalToolOutcome(item);
+    count = identityForOutput.signature === lastSignature && outcome === lastOutcome ? count + 1 : 1;
+    lastSignature = identityForOutput.signature;
+    lastOutcome = outcome;
+    latest = { name: identityForOutput.name, signature: identityForOutput.signature, count, outcome };
+  }
+  return latest && latest.count >= threshold ? latest : null;
+}
+
+function repeatRecoveryDirective(recovery) {
+  if (!recovery) return "";
+  const hash = crypto.createHash("sha256").update(recovery.signature).digest("hex").slice(0, 12);
+  return `[REPEAT RECOVERY GUARD: ${recovery.name} with the same arguments (${hash}) has already produced equivalent output ${recovery.count} consecutive times. Do NOT invoke that same tool with those same arguments again. The current approach made no observable progress. Continue the active task without stopping: inspect why the expected result is missing, verify assumptions and paths, then use a materially different command, arguments, or tool.]`;
+}
+
 function looksLikeDirectFileWrite(command) {
   if (typeof command !== "string" || !command) return false;
   return /\b(?:Set-Content|Add-Content|Out-File)\b/i.test(command) ||
@@ -1352,6 +1450,7 @@ function normalizeReasoningEffort(body) {
 function prepareRequest(original) {
   const body = clone(original);
   const maps = toolMaps();
+  const repeatGuard = repeatedToolCallRecovery(body);
 
   if (usesTemplateThinking(body)) {
     body.chat_template_kwargs = body.chat_template_kwargs && typeof body.chat_template_kwargs === "object"
@@ -1365,6 +1464,11 @@ function prepareRequest(original) {
   const reasoningNormalization = normalizeReasoningEffort(body);
   const instructionNormalization = normalizeInstructionMessages(body);
   const autonomyRule = "AUTONOMOUS EXECUTION PROTOCOL: You must work autonomously until the user's task or multi-step plan is 100% complete. If you just finished a sub-step (e.g. edited a file, applied a patch, or ran a tool), DO NOT stop with an explanation, plan summary, or progress message. You MUST immediately execute the next tool call. Before every git commit or push, run applicable syntax checks and tests; never publish code with a known validation failure. If any actionable work remains, including parked tasks, audits, tests, verification, builds, commits, or pushes, continue with a tool call instead of describing it as remaining work. Only emit a final text message when ALL planned steps are fully implemented, verified, and pushed.";
+  const repeatDirective = repeatRecoveryDirective(repeatGuard);
+  if (repeatDirective) {
+    body.instructions = `${String(body.instructions || "").trim()}\n\n${repeatDirective}`.trim();
+    diag(`REPEAT_GUARD recover name=${JSON.stringify(repeatGuard.name)} count=${repeatGuard.count} signature=${crypto.createHash("sha256").update(repeatGuard.signature).digest("hex").slice(0, 12)}`);
+  }
   if (typeof body.instructions === "string" && !body.instructions.includes("AUTONOMOUS EXECUTION PROTOCOL:")) {
     body.instructions = `${body.instructions.trim()}\n\n${autonomyRule}`;
   } else if (!body.instructions) {
@@ -1437,7 +1541,7 @@ function prepareRequest(original) {
     );
   }
 
-  return { body, maps, instructionNormalization, reasoningNormalization, postCompactPruning, postCompactToolPruning, historyRepairs };
+  return { body, maps, instructionNormalization, reasoningNormalization, postCompactPruning, postCompactToolPruning, historyRepairs, repeatGuard };
 }
 
 function namespaceInfo(name, maps) {
@@ -3356,6 +3460,25 @@ function selftest() {
   if (!looksLikeProgressOnly("I'll check the files first and then continue.")) {
     throw new Error("progress-only terminal detector failed");
   }
+
+  const repeatedInput = [{ role: "user", content: "Create the image" }];
+  for (let i = 1; i <= 3; i++) {
+    repeatedInput.push({ type: "function_call", call_id: `repeat-${i}`, name: "exec_command", arguments: JSON.stringify({ cmd: "python crop.py" }) });
+    repeatedInput.push({ type: "function_call_output", call_id: `repeat-${i}`, output: `Chunk ID: ${i}abc\nWall time: 0.${i} seconds\nProcess exited with code 0\nFinal output:\n` });
+  }
+  const repeatedPrepared = prepareRequest({ model: "llm", input: repeatedInput });
+  if (repeatedPrepared.repeatGuard?.count !== 3 || !repeatedPrepared.body.instructions.includes("REPEAT RECOVERY GUARD")) {
+    throw new Error("cross-turn repeat recovery guard failed");
+  }
+  const changedRepeat = clone({ model: "llm", input: repeatedInput });
+  changedRepeat.input.at(-2).arguments = JSON.stringify({ cmd: "python crop.py --verify" });
+  if (prepareRequest(changedRepeat).repeatGuard) throw new Error("repeat recovery ignored changed arguments");
+  const pollingInput = [{ role: "user", content: "Wait for completion" }];
+  for (let i = 1; i <= 3; i++) {
+    pollingInput.push({ type: "function_call", call_id: `poll-${i}`, name: "write_stdin", arguments: JSON.stringify({ session_id: 7 }) });
+    pollingInput.push({ type: "function_call_output", call_id: `poll-${i}`, output: "Script still running" });
+  }
+  if (prepareRequest({ model: "llm", input: pollingInput }).repeatGuard) throw new Error("polling call triggered repeat recovery");
 
   const memoryTemp = fs.mkdtempSync(path.join(require("os").tmpdir(), "codex-memory-selftest-"));
   let memoryStore = new MemoryStore(memoryTemp, true);
