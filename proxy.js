@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.38";
+const VERSION = "1.0.39";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -565,7 +565,38 @@ function toolMaps() {
   return {
     namespaceByFlat: new Map(), // flat -> { namespace, name }
     customByName: new Map(),    // name -> { name, argKey }
+    functionByName: new Map(),
+    namespaceAliases: new Set(),
   };
+}
+
+function normalizeMcpServerName(name) {
+  return String(name || "").replace(/__$/, "").replace(/^mcp__/, "").toLowerCase();
+}
+
+function localPathFromResourceUri(uri) {
+  let value = String(uri || "").trim();
+  if (/^file:\/\//i.test(value)) value = value.slice(7);
+  else if (!/^(?:[a-z]:[\\/]|\\\\|\/)/i.test(value)) return null;
+  try { value = decodeURIComponent(value); } catch { }
+  if (/^\/[a-z]:[\\/]/i.test(value)) value = value.slice(1);
+  return value || null;
+}
+
+function resourceReadFallback(name, args, maps) {
+  if (name !== "read_mcp_resource") return null;
+  let parsed;
+  try { parsed = JSON.parse(args || "{}"); } catch { return null; }
+  const server = normalizeMcpServerName(parsed?.server);
+  const filePath = localPathFromResourceUri(parsed?.uri);
+  if (!server || !filePath || !maps.namespaceAliases.has(server)) return null;
+  const tool = maps.functionByName.get("exec_command") || maps.functionByName.get("shell_command");
+  if (!tool) return null;
+  const key = tool.parameters?.properties?.cmd ? "cmd" : "command";
+  const windows = /^(?:[a-z]:[\\/]|\\\\)/i.test(filePath);
+  const escaped = filePath.replace(/'/g, windows ? "''" : "'\\''");
+  const command = windows ? `Get-Content -LiteralPath '${escaped}' -Raw` : `sed -n '1,$p' -- '${escaped}'`;
+  return { name: tool.name, arguments: JSON.stringify({ [key]: command }), server, uri: parsed.uri };
 }
 
 function customArgKey(name) {
@@ -634,12 +665,18 @@ function rewriteTools(body, maps) {
         f.description = patchGuide + (f.description ? "\n\n" + f.description : "");
       }
 
+      if (f.name === "read_mcp_resource") {
+        f.description = "Use only a server and URI returned by list_mcp_resources. A callable MCP tool namespace is not a resource server, and local file paths must be read with the shell tool." + (f.description ? "\n\n" + f.description : "");
+      }
+
+      maps.functionByName.set(f.name, f);
       out.push(f);
       continue;
     }
 
     if (tool.type === "namespace") {
       const ns = String(tool.name || "");
+      maps.namespaceAliases.add(normalizeMcpServerName(ns));
       for (const inner of Array.isArray(tool.tools) ? tool.tools : []) {
         if (!inner || inner.type !== "function" || typeof inner.name !== "string") continue;
         const flat = flatNs(ns, inner.name);
@@ -650,6 +687,7 @@ function rewriteTools(body, maps) {
         f.name = flat;
         delete f.defer_loading;
         delete f.output_schema;
+        maps.functionByName.set(f.name, f);
         out.push(f);
       }
       continue;
@@ -1551,6 +1589,12 @@ function namespaceInfo(name, maps) {
 function convertFunctionItem(item, maps) {
   if (!item || item.type !== "function_call" || typeof item.name !== "string") return item;
 
+  const fallback = resourceReadFallback(item.name, item.arguments, maps);
+  if (fallback) {
+    diag(`MCP_RESOURCE_GUARD server=${JSON.stringify(fallback.server)} uri=${JSON.stringify(fallback.uri)} fallback=${fallback.name}`);
+    return { ...item, name: fallback.name, arguments: fallback.arguments };
+  }
+
   const custom = maps.customByName.get(item.name);
   if (custom) {
     if (custom.name === "apply_patch") diag("EDIT apply_patch via dedicated native tool");
@@ -1901,6 +1945,7 @@ class SseTranslator {
     this.maps = maps;
     this.requestMeta = requestMeta;
     this.customItems = new Map(); // item_id -> { name, args, output_index, call_id }
+    this.resourceItems = new Map();
     this.outputIndexByItem = new Map();
     this.nextOutputIndex = 0;
     this.text = "";
@@ -2052,6 +2097,42 @@ class SseTranslator {
 
     if (evt.type === "response.output_text.delta" && typeof evt.delta === "string") {
       this.text += evt.delta;
+    }
+
+    if (evt.type === "response.output_item.added" && evt.item?.type === "function_call" && evt.item.name === "read_mcp_resource") {
+      const id = evt.item.id || evt.item.call_id;
+      this.resourceItems.set(id, { args: evt.item.arguments || "", events: [this.event(evt)] });
+      return [];
+    }
+
+    if ((evt.type === "response.function_call_arguments.delta" || evt.type === "response.function_call_arguments.done") && this.resourceItems.has(evt.item_id)) {
+      const st = this.resourceItems.get(evt.item_id);
+      st.events.push(this.event(evt));
+      if (evt.type.endsWith(".delta")) st.args += evt.delta || "";
+      else if (typeof evt.arguments === "string") st.args = evt.arguments;
+      return [];
+    }
+
+    if (evt.type === "response.output_item.done" && evt.item?.type === "function_call") {
+      const id = evt.item.id || evt.item.call_id;
+      const st = this.resourceItems.get(id);
+      if (st) {
+        const args = typeof evt.item.arguments === "string" ? evt.item.arguments : st.args;
+        const fallback = resourceReadFallback(evt.item.name, args, this.maps);
+        this.resourceItems.delete(id);
+        if (!fallback) {
+          this.sawToolCall = true;
+          return [...st.events, this.event(evt)];
+        }
+        this.sawToolCall = true;
+        const item = { ...evt.item, name: fallback.name, arguments: fallback.arguments };
+        diag(`MCP_RESOURCE_GUARD server=${JSON.stringify(fallback.server)} uri=${JSON.stringify(fallback.uri)} fallback=${fallback.name}`);
+        return [
+          this.event({ type: "response.output_item.added", output_index: evt.output_index, item: { ...item, arguments: "" } }),
+          this.event({ type: "response.function_call_arguments.done", item_id: item.id, call_id: item.call_id, output_index: evt.output_index, arguments: fallback.arguments }),
+          this.event({ ...evt, item })
+        ];
+      }
     }
 
     if (evt.type === "response.output_item.added" && evt.item?.type === "function_call") {
@@ -3006,6 +3087,61 @@ function selftest() {
     throw new Error("ordinary shell stream transparency failed");
   }
   for (const part of [shellAdded, shellArgs, shellDone]) parseSseJsonEvents(part);
+
+  const resourcePrepared = prepareRequest({ tools: [
+    { type: "function", name: "exec_command", description: "Run", parameters: { type: "object", properties: { cmd: { type: "string" } }, required: ["cmd"] } },
+    { type: "function", name: "read_mcp_resource", description: "Read resource", parameters: { type: "object", properties: { server: { type: "string" }, uri: { type: "string" } } } },
+    { type: "namespace", name: "mcp__codebase_memory_mcp", tools: [{ type: "function", name: "search_graph", parameters: { type: "object" } }] }
+  ] });
+  if (!resourcePrepared.body.tools.find(x => x.name === "read_mcp_resource")?.description?.includes("returned by list_mcp_resources")) {
+    throw new Error("MCP resource guidance injection failed");
+  }
+  const resourceStream = new SseTranslator(resourcePrepared.maps);
+  const resourceArgs = JSON.stringify({ server: "codebase_memory_mcp", uri: "file://C:\\work\\src\\main.js" });
+  const resourceAdded = resourceStream.translate("data: " + JSON.stringify({
+    type: "response.output_item.added",
+    output_index: 0,
+    item: { id: "fc_resource", type: "function_call", call_id: "call_resource", name: "read_mcp_resource", arguments: "" }
+  }));
+  const resourceArgsDone = resourceStream.translate("data: " + JSON.stringify({
+    type: "response.function_call_arguments.done",
+    item_id: "fc_resource",
+    output_index: 0,
+    arguments: resourceArgs
+  }));
+  const resourceDone = parseSseJsonEvents(resourceStream.translate("data: " + JSON.stringify({
+    type: "response.output_item.done",
+    output_index: 0,
+    item: { id: "fc_resource", type: "function_call", call_id: "call_resource", name: "read_mcp_resource", arguments: resourceArgs }
+  })));
+  if (resourceAdded.length || resourceArgsDone.length || resourceDone.length !== 3 ||
+    resourceDone.some(x => x?.item?.name === "read_mcp_resource") ||
+    resourceDone[2]?.item?.name !== "exec_command" ||
+    !JSON.parse(resourceDone[2].item.arguments).cmd.includes("C:\\work\\src\\main.js")) {
+    throw new Error("invalid MCP resource call fallback failed");
+  }
+  const resourceCompleted = parseSseJsonEvents(resourceStream.translate("data: " + JSON.stringify({
+    type: "response.completed",
+    response: { id: "resp_resource", status: "completed", output: [{ id: "fc_resource", type: "function_call", call_id: "call_resource", name: "read_mcp_resource", arguments: resourceArgs }] }
+  })));
+  if (resourceCompleted[0]?.response?.output?.[0]?.name !== "exec_command") {
+    throw new Error("completed MCP resource fallback consistency failed");
+  }
+  const validResourceStream = new SseTranslator(resourcePrepared.maps);
+  const validResourceArgs = JSON.stringify({ server: "documentation", uri: "docs://guide" });
+  validResourceStream.translate("data: " + JSON.stringify({
+    type: "response.output_item.added",
+    output_index: 0,
+    item: { id: "fc_valid_resource", type: "function_call", call_id: "call_valid_resource", name: "read_mcp_resource", arguments: "" }
+  }));
+  const validResourceDone = parseSseJsonEvents(validResourceStream.translate("data: " + JSON.stringify({
+    type: "response.output_item.done",
+    output_index: 0,
+    item: { id: "fc_valid_resource", type: "function_call", call_id: "call_valid_resource", name: "read_mcp_resource", arguments: validResourceArgs }
+  })));
+  if (validResourceDone.length !== 2 || validResourceDone[1]?.item?.name !== "read_mcp_resource") {
+    throw new Error("valid MCP resource call was modified");
+  }
 
   // Thinking/reasoning events must pass through without renaming, buffering or
   // content mutation.
