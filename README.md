@@ -60,6 +60,8 @@ Start the proxy on Windows:
 & "$HOME\.codex-llama\start-proxy.cmd"
 ```
 
+The Windows launcher supervises the proxy process. A single delayed health check does not restart it: recovery requires six consecutive failures plus a final ten-second probe. Actual process exits are restarted immediately.
+
 In another PowerShell window, start Codex with the generated home:
 
 ```powershell
@@ -175,6 +177,7 @@ The installer creates:
 - `model_catalog.json`
 - `mcp_supervisor.js`
 - `proxy.js`
+- `proxy_watchdog.ps1`
 - `env.cmd` and `env.sh`
 - `start-proxy.cmd` and `start-proxy.sh`
 - `install-state.json`

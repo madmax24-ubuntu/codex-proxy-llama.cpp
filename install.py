@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "1.0.39"
+VERSION = "1.0.40"
 MARKER = "generated_by_codex_proxy_llama_cpp"
 
 
@@ -323,7 +323,14 @@ def render_start_cmd(settings: Settings) -> str:
         "@echo off\r\n"
         "call \"%~dp0env.cmd\"\r\n"
         "node \"%CODEX_HOME%\\proxy.js\" --selftest || exit /b 1\r\n"
-        "node \"%CODEX_HOME%\\proxy.js\"\r\n"
+        "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%CODEX_HOME%\\proxy_watchdog.ps1\" -SelfTest || exit /b 1\r\n"
+        "set \"PROXY_SCRIPT=%CODEX_HOME%\\proxy.js\"\r\n"
+        "set \"PROXY_PID_FILE=%CODEX_HOME%\\proxy.pid\"\r\n"
+        "set \"PROXY_STDOUT=%CODEX_HOME%\\proxy.log\"\r\n"
+        "set \"PROXY_STDERR=%CODEX_HOME%\\proxy.err.log\"\r\n"
+        "set \"PROXY_WATCHDOG_LOG=%CODEX_HOME%\\proxy-watchdog.log\"\r\n"
+        "set \"CODEX_PROXY_WATCHDOG_FAILURE_THRESHOLD=6\"\r\n"
+        "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%CODEX_HOME%\\proxy_watchdog.ps1\"\r\n"
     )
 
 
@@ -346,15 +353,19 @@ def backup(path: Path) -> Path:
 def write_install(settings: Settings, force: bool, dry_run: bool) -> list[Path]:
     source_proxy = Path(__file__).resolve().with_name("proxy.js")
     source_mcp_supervisor = Path(__file__).resolve().with_name("mcp_supervisor.js")
+    source_watchdog = Path(__file__).resolve().with_name("proxy_watchdog.ps1")
     if not source_proxy.exists():
         raise FileNotFoundError(f"proxy.js not found next to installer: {source_proxy}")
     if not source_mcp_supervisor.exists():
         raise FileNotFoundError(f"mcp_supervisor.js not found next to installer: {source_mcp_supervisor}")
+    if not source_watchdog.exists():
+        raise FileNotFoundError(f"proxy_watchdog.ps1 not found next to installer: {source_watchdog}")
     files: dict[Path, str | bytes] = {
         settings.codex_home / "config.toml": render_config(settings),
         settings.codex_home / "model_catalog.json": render_catalog(settings),
         settings.codex_home / "proxy.js": source_proxy.read_bytes(),
         settings.codex_home / "mcp_supervisor.js": source_mcp_supervisor.read_bytes(),
+        settings.codex_home / "proxy_watchdog.ps1": source_watchdog.read_bytes(),
         settings.codex_home / "env.cmd": render_env_cmd(settings),
         settings.codex_home / "env.sh": render_env_sh(settings),
         settings.codex_home / "start-proxy.cmd": render_start_cmd(settings),

@@ -48,9 +48,12 @@ class InstallerTests(unittest.TestCase):
             root = Path(temp) / "codex-home"
             settings = self.settings(root)
             files = install.write_install(settings, False, False)
-            self.assertEqual(len(files), 9)
+            self.assertEqual(len(files), 10)
             self.assertTrue((root / "proxy.js").exists())
             self.assertTrue((root / "mcp_supervisor.js").exists())
+            self.assertTrue((root / "proxy_watchdog.ps1").exists())
+            start_cmd = (root / "start-proxy.cmd").read_text(encoding="utf-8")
+            self.assertIn("CODEX_PROXY_WATCHDOG_FAILURE_THRESHOLD=6", start_cmd)
             config = (root / "config.toml").read_text(encoding="utf-8")
             self.assertIn("model_provider", config)
             self.assertIn("Interrupted. You are creating a CONTEXT CHECKPOINT SUMMARY", config)
