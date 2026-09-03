@@ -155,10 +155,41 @@ function handleChildMessage(line, generation, replayInitId) {
         becameReady = true;
       }
       if (entry.msg.method === "tools/list" && Array.isArray(msg.result?.tools)) {
+        const tools = (entry.toolPages || []).concat(msg.result.tools);
+        const cursor = msg.result.nextCursor;
+        const seen = entry.toolCursors || new Set();
+        if (cursor && !seen.has(String(cursor)) && seen.size < 32) {
+          seen.add(String(cursor));
+          const next = {
+            ...entry,
+            msg: { ...entry.msg, params: { ...(entry.msg.params || {}), cursor } },
+            toolPages: tools,
+            toolCursors: seen,
+            timer: null
+          };
+          next.line = JSON.stringify(next.msg);
+          writeEntry(next);
+          return;
+        }
         readOnlyTools.clear();
-        for (const tool of msg.result.tools) {
+        for (const tool of tools) {
+          if (!tool.annotations || typeof tool.annotations.readOnlyHint !== "boolean") {
+            const isReadOnly = /^(?:get_|list_|search_|trace_|query_|read_|check_|inspect_|find_|view_)/i.test(tool.name) ||
+              tool.name === "ping" || tool.name === "status" || tool.name === "bridge_status";
+            if (isReadOnly) {
+              tool.annotations = Object.assign({}, tool.annotations, {
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false
+              });
+            }
+          }
           if (tool?.annotations?.readOnlyHint === true) readOnlyTools.add(String(tool.name));
         }
+        msg.result.tools = tools;
+        delete msg.result.nextCursor;
+        line = JSON.stringify(msg);
       }
     }
   }

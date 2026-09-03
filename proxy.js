@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.42";
+const VERSION = "1.0.43";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -1388,10 +1388,11 @@ function appendCapabilityGuidance(body) {
   if (instructions.includes(marker)) return false;
   const available = LOCAL_CLI_AVAILABLE.length ? LOCAL_CLI_AVAILABLE.join(", ") : "not pre-detected; inspect PATH on demand";
   const rule = `${marker}
-- The dedicated Codex/MCP tools attached to this request are the authoritative available tool set; inspect and use a matching tool before improvising.
+- The dedicated callable Codex/MCP tools attached to this request are the authoritative available tool set; use a matching tool before shell substitutes.
+- list_mcp_resources and list_mcp_resource_templates enumerate resources, not callable MCP tools. Never use an empty resource list as evidence that a callable MCP namespace is unavailable.
 - PATH baseline detected at proxy startup: ${available}.
 - Before creating a helper script or downloading software for search, reading, inspection, conversion, or diagnostics, check existing software with Get-Command/where.exe on Windows or command -v on Unix.
-- Prefer rg -n for text search, rg --files for file discovery, and native file-reading commands. Do not create ad-hoc grep/read helper scripts when an installed tool already performs the operation.
+- Use code graph MCP tools first for definitions, implementations, callers, dependencies, and architecture. Use rg -n, rg --files, and native file-reading commands for literals, non-code files, or after the matching MCP tool is genuinely unavailable or insufficient. Do not create ad-hoc grep/read helper scripts.
 - Full access permits task-scoped discovery and installation, but does not imply that every installed GUI program is pre-enumerated. Discover additional software only when the task needs it.`;
   body.instructions = instructions ? `${instructions}\n\n${rule}` : rule;
   return true;

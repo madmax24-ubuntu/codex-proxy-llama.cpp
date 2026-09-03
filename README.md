@@ -211,6 +211,8 @@ MCP_SUPERVISOR_REQUEST_TIMEOUT_MS = "300000"
 
 For a read-only server, add `"--retry-inflight"` before `"--"`. Prefer launching the installed server entry point directly instead of keeping `npx` in the long-running process chain.
 
+The supervisor aggregates paginated `tools/list` responses before returning the catalog to Codex and infers `readOnlyHint: true` for safe read-only tools when the upstream server omits annotations. This prevents non-interactive environments (`approval = "never"`) from silently hiding or blocking MCP tools. MCP resource listing is separate from callable tool discovery, so an empty resource list does not mean the server has no tools.
+
 Inspect or remove entries:
 
 ```bash

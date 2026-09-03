@@ -32,6 +32,7 @@ class InstallerTests(unittest.TestCase):
             catalog = json.loads(install.render_catalog(self.settings(Path(temp))))
         model = catalog["models"][0]
         self.assertEqual(model["apply_patch_tool_type"], "freeform")
+        self.assertEqual(model["tool_mode"], "direct")
         self.assertEqual(model["effective_context_window_percent"], 95)
         self.assertEqual(model["supported_reasoning_levels"][-1]["effort"], "xhigh")
         self.assertIn("Before every commit or push", model["base_instructions"])
@@ -58,6 +59,7 @@ class InstallerTests(unittest.TestCase):
             self.assertIn("model_provider", config)
             self.assertIn("Interrupted. You are creating a CONTEXT CHECKPOINT SUMMARY", config)
             self.assertIn("## NEXT ACTION", config)
+            self.assertIn("tool_search_always_defer_mcp_tools = false", config)
             install.write_install(settings, True, False)
             self.assertTrue(list(root.glob("config.toml.backup-*")))
 

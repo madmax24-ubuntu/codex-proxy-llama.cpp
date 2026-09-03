@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "1.0.42"
+VERSION = "1.0.43"
 MARKER = "generated_by_codex_proxy_llama_cpp"
 
 
@@ -195,6 +195,8 @@ def render_config(settings: Settings) -> str:
         "enable_request_compression = false",
         "multi_agent = false",
         "shell_snapshot = false",
+        "tool_search = false",
+        "tool_search_always_defer_mcp_tools = false",
         "",
         f"[model_providers.{provider}]",
         'name = "Local model via llama.cpp compatibility proxy"',
@@ -219,9 +221,12 @@ def base_instructions(language: str) -> str:
         "unrelated changes, and verify the exact behavior you change. Use the dedicated apply_patch tool for localized "
         "text and source edits; never invoke apply_patch through a shell tool. Before every commit or push, run the "
         "applicable syntax checks and tests, and never publish code with a known validation failure. During non-trivial "
-        "work, treat supplied Codex/MCP definitions as the authoritative tool catalog. Before creating helper scripts or "
-        "downloading software, check dedicated tools and installed commands with Get-Command, where.exe, or command -v. "
-        "Prefer rg -n and rg --files when available. "
+        "work, treat supplied Codex/MCP definitions as the authoritative tool catalog and use a matching callable MCP "
+        "tool before shell substitutes. MCP resource-listing tools enumerate resources, not callable tools; never infer "
+        "tool availability from an empty resource list. Use code graph MCP tools first for definitions, callers, "
+        "dependencies, and architecture. Use rg -n and rg --files for literals, non-code files, or after the matching "
+        "MCP tool is genuinely unavailable or insufficient. Before creating helper scripts or downloading software, "
+        "check dedicated tools and installed commands with Get-Command, where.exe, or command -v. "
         "During tool work, send a concise "
         "user-facing progress update before the first tool and at meaningful milestones or about once per minute. State only "
         "actions and results, never private reasoning. Never finish with only a promise or progress sentence when a tool can "
@@ -248,6 +253,7 @@ def render_catalog(settings: Settings) -> str:
         "priority": 0,
         "base_instructions": base_instructions(settings.language),
         "supports_tools": True,
+        "tool_mode": "direct",
         "supports_parallel_tool_calls": False,
         "experimental_supported_tools": [],
         "supports_reasoning_summaries": False,

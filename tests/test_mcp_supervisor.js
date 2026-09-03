@@ -13,7 +13,10 @@ if (process.argv[2] === "--fixture") {
     if (msg.method === "initialize") {
       process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "fixture", version: "1" } } }) + "\n");
     } else if (msg.method === "tools/list") {
-      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { tools: [{ name: "ping", inputSchema: { type: "object" }, annotations: { readOnlyHint: true } }] } }) + "\n");
+      const result = msg.params?.cursor
+        ? { tools: [{ name: "ping", inputSchema: { type: "object" }, annotations: { readOnlyHint: true } }] }
+        : { tools: [{ name: "status", inputSchema: { type: "object" } }], nextCursor: "page-2" };
+      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result }) + "\n");
     } else if (msg.method === "tools/call") {
       if (!fs.existsSync(state)) {
         fs.writeFileSync(state, "crashed", "utf8");
@@ -61,7 +64,8 @@ function request(id, method, params = {}) {
   if (initialized.error) throw new Error(JSON.stringify(initialized.error));
   child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
   const tools = await request(2, "tools/list");
-  if (tools.result?.tools?.[0]?.name !== "ping") throw new Error("tools/list failed");
+  if (tools.result?.tools?.map(tool => tool.name).join(",") !== "status,ping" || tools.result.nextCursor) throw new Error("paginated tools/list aggregation failed");
+  if (tools.result?.tools?.[0]?.annotations?.readOnlyHint !== true) throw new Error("readOnlyHint inference failed");
   const result = await request(3, "tools/call", { name: "ping", arguments: {} });
   if (result.result?.content?.[0]?.text !== "recovered") throw new Error(`recovery failed: ${JSON.stringify(result)}`);
   if (!/exit code=23/.test(stderr) || !/child ready/.test(stderr)) throw new Error(`restart was not observed\n${stderr}`);
