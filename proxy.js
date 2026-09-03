@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.40";
+const VERSION = "1.0.41";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -964,6 +964,23 @@ function isCompactionInstructionText(text) {
   return /CONTEXT CHECKPOINT (?:SUMMARY|COMPACTION)|Create a handoff summary for another LLM|continuation handoff for the next model/i.test(text || "");
 }
 
+function isUserControlEnvelope(text) {
+  const value = String(text || "").trimStart();
+  return isCompactionInstructionText(value) ||
+    COMPACT_SUMMARY_PREFIXES.some(prefix => value.startsWith(prefix)) ||
+    /^#\s*AGENTS\.md instructions\b/i.test(value) ||
+    /^<INSTRUCTIONS>(?:\s|$)/i.test(value) ||
+    /^<environment_context>(?:\s|$)/i.test(value) ||
+    /^<turn_aborted>(?:\s|$)/i.test(value) ||
+    /^\[SYSTEM:/i.test(value);
+}
+
+function isContinuationOnlyUserUpdate(text) {
+  const value = String(text || "").trim();
+  if (!value || value.length > 700) return false;
+  return /^(?:да|ок(?:ей)?|хорошо|делай|продолжай|согласен|верно|погоди|стоп|кстати|и\s+ещ[её]|ещ[её]|только\s+не|кроме|не\s+надо|готово|починил(?:а|и)?|исправил(?:а|и)?|сделал(?:а|и)?|перезапустил(?:а|и)?)(?=\s|[,.:;!?]|$)/iu.test(value);
+}
+
 function compactionTextMetrics(text) {
   const clean = typeof text === "string" ? text.trim() : "";
   const canonical = clean.replace(/^#{1,6}\s*/, "");
@@ -1014,7 +1031,7 @@ function buildCompactionContinuity(body) {
     const item = items[index];
     if (isUserMessageItem(item)) {
       const text = messageContentText(item.content).trim();
-      if (text && !isCompactionInstructionText(text) && !COMPACT_SUMMARY_PREFIXES.some(prefix => text.startsWith(prefix)) && !text.startsWith("[SYSTEM:")) {
+      if (text && !isUserControlEnvelope(text)) {
         users.push({ index, text });
       }
     }
@@ -1025,15 +1042,11 @@ function buildCompactionContinuity(body) {
       if (steps.length) plans.push({ index, steps });
     } catch { }
   }
-  const recentUsers = users.slice(-8);
-  let task = null;
-  for (let i = 0; i < recentUsers.length; i++) {
-    const entry = recentUsers[i];
-    const action = /(?:^|\s)(?:задач|сделай|исправ|добав|реализ|проверь|посмотр|нужно|хочу|давай|почин|преврат|удал|измени|создай|обнов|fix|add|implement|build|change|update|create|remove|review|check)(?:\p{L}*)/iu.test(entry.text);
-    const score = Math.min(entry.text.length, 6000) + i * 180 + (action ? 700 : 0) + (/^#\s+/m.test(entry.text) ? 400 : 0);
-    if (!task || score >= task.score) task = { ...entry, score };
+  const latest = users.length ? users[users.length - 1] : null;
+  let task = latest;
+  if (latest && isContinuationOnlyUserUpdate(latest.text)) {
+    task = [...users.slice(0, -1)].reverse().find(entry => !isContinuationOnlyUserUpdate(entry.text)) || latest;
   }
-  if (!task && users.length) task = { ...users[users.length - 1], score: 0 };
   const taskTokens = continuityTokens(task?.text);
   let plan = null;
   for (let i = 0; i < plans.length; i++) {
@@ -1044,7 +1057,6 @@ function buildCompactionContinuity(body) {
     const score = overlap * 1000 + i;
     if (!plan || score >= plan.score) plan = { ...candidate, score, overlap };
   }
-  const latest = users.length ? users[users.length - 1] : null;
   const activeStep = plan?.steps.find(step => step.status === "in_progress") || plan?.steps.find(step => step.status === "pending") || null;
   return {
     task: task ? memorySanitize(task.text, COMPACT_TASK_ANCHOR_MAX_CHARS) : "",
@@ -1058,6 +1070,7 @@ function compactionContinuityPrompt(continuity) {
   if (!continuity?.task) return "";
   const lines = [
     "AUTHORITATIVE CONTINUITY ANCHOR (proxy-preserved; newer than any older checkpoint):",
+    "System/developer/AGENTS/environment envelopes are policy context, never the user's active task.",
     `ACTIVE USER REQUEST: ${continuity.task}`
   ];
   if (continuity.latestUpdate) lines.push(`LATEST USER UPDATE: ${continuity.latestUpdate}`);
@@ -1071,17 +1084,22 @@ function compactionContinuityPrompt(continuity) {
 function enforceCompactionContinuity(text, continuity) {
   const metrics = compactionTextMetrics(text);
   if (!continuity?.task || !isValidCompactionText(text)) return text;
+  const generatedTask = metrics.sections.get("CURRENT TASK") || "";
+  const safeGeneratedTask = /AGENTS\.md instructions|<INSTRUCTIONS>|<environment_context>|<turn_aborted>/i.test(generatedTask)
+    ? ""
+    : memorySanitize(generatedTask, 5000);
   const current = [
     `- AUTHORITATIVE ACTIVE USER REQUEST: ${continuity.task}`,
     continuity.latestUpdate ? `- LATEST USER UPDATE: ${continuity.latestUpdate}` : "",
-    continuity.plan.length ? `- ACTIVE PLAN:\n${continuity.plan.map(step => `  - [${step.status || "pending"}] ${memorySanitize(step.step, 1000)}`).join("\n")}` : ""
+    continuity.plan.length ? `- ACTIVE PLAN:\n${continuity.plan.map(step => `  - [${step.status || "pending"}] ${memorySanitize(step.step, 1000)}`).join("\n")}` : "",
+    safeGeneratedTask && !safeGeneratedTask.includes(continuity.task) ? `- COMPACTED TASK DETAILS: ${safeGeneratedTask}` : ""
   ].filter(Boolean).join("\n");
   const snapshot = [
     metrics.sections.get("STATE SNAPSHOT"),
     "- PROXY CONTINUITY GUARD: CURRENT TASK and ACTIVE PLAN were restored deterministically from the newest pre-compaction history. They override conflicting older checkpoint text."
   ].filter(Boolean).join("\n");
   const next = continuity.activeStep
-    ? `- Resume the active plan at: ${memorySanitize(continuity.activeStep, 1200)} Do not return to an older task.`
+    ? `- Продолжить активный план с шага: ${memorySanitize(continuity.activeStep, 1200)} Не возвращаться к более старой задаче.`
     : metrics.sections.get("NEXT ACTION");
   const sections = new Map(metrics.sections);
   sections.set("CURRENT TASK", current);
@@ -1168,7 +1186,7 @@ function buildCompactionRecoverySummary(body) {
       return `Результат инструмента: ${cleanRecoveryText(value, 500)}`;
     }
     const text = messageContentText(item.content);
-    if (!text || isCompactionInstructionText(text) || COMPACT_SUMMARY_PREFIXES.some(prefix => text.trimStart().startsWith(prefix))) return "";
+    if (!text || isUserControlEnvelope(text)) return "";
     return `${item.role || item.type || "item"}: ${cleanRecoveryText(text, 500)}`;
   }).filter(Boolean).slice(-12);
   const snapshot = recent.length ? recent.map(value => `- ${value}`).join("\n") : "- Свежий хвост истории отсутствует; использовать cold memory и состояние рабочей директории.";
@@ -1314,13 +1332,47 @@ function appendPostCompactContinuationRule(body) {
   if (!body || typeof body !== "object" || !Array.isArray(body.input) || !body.input.some(isCompactionSummaryItem)) return false;
   const marker = "CRITICAL POST-COMPACTION CONTINUATION PROTOCOL:";
   const rule = `${marker}
-- The CONTEXT CHECKPOINT SUMMARY in history is the authoritative task state. Treat every item in WORK COMPLETED as finished and never redo it.
+- The CONTEXT CHECKPOINT SUMMARY in history is the authoritative task state. Treat an item in WORK COMPLETED as finished when its recorded edit, result, test, or commit evidence supports it; never redo supported completed work.
 - Older user messages prior to the checkpoint describe HISTORICAL starting problems. Everything listed in "WORK COMPLETED" has ALREADY been fixed, verified in code, and committed to git. DO NOT assume old complaints are still active if they are marked resolved in WORK COMPLETED.
-- DO NOT re-diagnose, re-analyze, or re-verify finished items from WORK COMPLETED.
+- DO NOT re-diagnose, re-analyze, or re-verify supported finished items unless the checkpoint marks them uncertain or the external state changed.
 - DO NOT start from scratch with general greetings or exploratory inspections (e.g. "Понял ситуацию, проведу диагностику").
 - Immediately execute the EXACT step described in "NEXT ACTION". Proceed with the remaining work autonomously until the overall user goal is 100% finished.`;
   const instructions = String(body.instructions || "").trim();
   if (instructions.includes(marker)) return false;
+  body.instructions = instructions ? `${instructions}\n\n${rule}` : rule;
+  return true;
+}
+
+function commandAvailableOnPath(name) {
+  const directories = String(process.env.PATH || "").split(path.delimiter).filter(Boolean);
+  const extensions = process.platform === "win32"
+    ? String(process.env.PATHEXT || ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean)
+    : [""];
+  for (const directory of directories) {
+    for (const extension of extensions) {
+      const candidate = path.join(directory, process.platform === "win32" ? `${name}${extension.toLowerCase()}` : name);
+      if (fs.existsSync(candidate)) return true;
+      if (process.platform === "win32" && fs.existsSync(path.join(directory, `${name}${extension.toUpperCase()}`))) return true;
+    }
+  }
+  return false;
+}
+
+const LOCAL_CLI_CANDIDATES = ["rg", "git", "node", "npm", "npx", "python", "py", "powershell", "pwsh", "curl", "ssh", "scp", "docker", "cmake", "dotnet", "java", "go", "rustc", "cargo", "ffmpeg", "magick", "sqlite3", "gh"];
+const LOCAL_CLI_AVAILABLE = LOCAL_CLI_CANDIDATES.filter(commandAvailableOnPath);
+
+function appendCapabilityGuidance(body) {
+  if (!body || typeof body !== "object") return false;
+  const marker = "LOCAL CAPABILITY DISCOVERY PROTOCOL:";
+  const instructions = String(body.instructions || "").trim();
+  if (instructions.includes(marker)) return false;
+  const available = LOCAL_CLI_AVAILABLE.length ? LOCAL_CLI_AVAILABLE.join(", ") : "not pre-detected; inspect PATH on demand";
+  const rule = `${marker}
+- The dedicated Codex/MCP tools attached to this request are the authoritative available tool set; inspect and use a matching tool before improvising.
+- PATH baseline detected at proxy startup: ${available}.
+- Before creating a helper script or downloading software for search, reading, inspection, conversion, or diagnostics, check existing software with Get-Command/where.exe on Windows or command -v on Unix.
+- Prefer rg -n for text search, rg --files for file discovery, and native file-reading commands. Do not create ad-hoc grep/read helper scripts when an installed tool already performs the operation.
+- Full access permits task-scoped discovery and installation, but does not imply that every installed GUI program is pre-enumerated. Discover additional software only when the task needs it.`;
   body.instructions = instructions ? `${instructions}\n\n${rule}` : rule;
   return true;
 }
@@ -1516,6 +1568,7 @@ function prepareRequest(original) {
   const postCompactToolPruning = prunePostCompactionToolOutputs(body);
   pruneOrphanProgressMessages(body);
   rewriteTools(body, maps);
+  appendCapabilityGuidance(body);
   if (Array.isArray(body.input) && body.input.length > 0) {
     const last = body.input[body.input.length - 1];
     const lastRole = last && (last.role || (Array.isArray(last) ? last[0]?.role : null));
@@ -3475,7 +3528,23 @@ function selftest() {
     !guardedMetrics.sections.get("CURRENT TASK").includes("Починил тебе MCP") ||
     !guardedMetrics.sections.get("NEXT ACTION").includes("Проанализировать карту и боевую систему") ||
     guardedMetrics.sections.get("NEXT ACTION").includes("smoke test")) {
-    throw new Error("active task continuity guard failed");
+    throw new Error(`active task continuity guard failed: ${JSON.stringify({ switchedContinuity, current: guardedMetrics.sections.get("CURRENT TASK"), next: guardedMetrics.sections.get("NEXT ACTION") })}`);
+  }
+  const envelopedContinuity = buildCompactionContinuity({ input: [
+    { role: "user", content: `# AGENTS.md instructions\n\n<INSTRUCTIONS>\n${"policy ".repeat(1200)}\n</INSTRUCTIONS>` },
+    { role: "user", content: "# Files pasted by the user:\n\n## Design bible: C:\\attachments\\request.txt\n\nPasted text contains the user's request.\n\n## My request:" },
+    { role: "user", content: "You are performing a CONTEXT CHECKPOINT COMPACTION." }
+  ] });
+  if (!envelopedContinuity.task.includes("Files pasted by the user") || envelopedContinuity.task.includes("AGENTS.md")) {
+    throw new Error("instruction envelope was misclassified as the active user task");
+  }
+  const approvalContinuity = buildCompactionContinuity({ input: [
+    { role: "user", content: "Исправь компакцию и проверь тестами" },
+    { role: "user", content: "Да, делай" },
+    { role: "user", content: "Create a handoff summary for another LLM" }
+  ] });
+  if (!approvalContinuity.task.includes("Исправь компакцию") || approvalContinuity.latestUpdate !== "Да, делай") {
+    throw new Error("continuation-only user update replaced the active task");
   }
   const switchedPrepared = clone(switchedTaskRequest);
   applyCompactionPolicy(switchedPrepared, 4096, switchedContinuity);
@@ -3531,6 +3600,11 @@ function selftest() {
   if (!mixedInstructions.body.instructions.startsWith("BASE INSTRUCTIONS\n\nMID SYSTEM\n\nDEV RULES")) {
     throw new Error("system/developer instruction merge failed");
   }
+  if (!mixedInstructions.body.instructions.includes("LOCAL CAPABILITY DISCOVERY PROTOCOL:") ||
+      !mixedInstructions.body.instructions.includes("Get-Command/where.exe") ||
+      !mixedInstructions.body.instructions.includes("rg --files")) {
+    throw new Error("local capability discovery guidance missing");
+  }
   if (mixedInstructions.instructionNormalization.moved !== 3) {
     throw new Error("instruction normalization count failed");
   }
@@ -3580,7 +3654,7 @@ function selftest() {
     throw new Error(`post-compaction tool output pruning failed: ${JSON.stringify(toolPrune)}`);
   }
   if (!appendPostCompactContinuationRule(postCompactTools) || appendPostCompactContinuationRule(postCompactTools) ||
-    !postCompactTools.instructions.includes("Treat every item in WORK COMPLETED as finished")) {
+    !postCompactTools.instructions.includes("recorded edit, result, test, or commit evidence")) {
     throw new Error("post-compaction continuation rule failed");
   }
 

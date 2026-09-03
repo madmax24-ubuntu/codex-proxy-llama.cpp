@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "1.0.40"
+VERSION = "1.0.41"
 MARKER = "generated_by_codex_proxy_llama_cpp"
 
 
@@ -219,7 +219,10 @@ def base_instructions(language: str) -> str:
         "unrelated changes, and verify the exact behavior you change. Use the dedicated apply_patch tool for localized "
         "text and source edits; never invoke apply_patch through a shell tool. Before every commit or push, run the "
         "applicable syntax checks and tests, and never publish code with a known validation failure. During non-trivial "
-        "tool work, send a concise "
+        "work, treat supplied Codex/MCP definitions as the authoritative tool catalog. Before creating helper scripts or "
+        "downloading software, check dedicated tools and installed commands with Get-Command, where.exe, or command -v. "
+        "Prefer rg -n and rg --files when available. "
+        "During tool work, send a concise "
         "user-facing progress update before the first tool and at meaningful milestones or about once per minute. State only "
         "actions and results, never private reasoning. Never finish with only a promise or progress sentence when a tool can "
         "advance the task. " + language_rule
@@ -331,6 +334,7 @@ def render_start_cmd(settings: Settings) -> str:
         "set \"PROXY_WATCHDOG_LOG=%CODEX_HOME%\\proxy-watchdog.log\"\r\n"
         "set \"CODEX_PROXY_WATCHDOG_FAILURE_THRESHOLD=6\"\r\n"
         "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%CODEX_HOME%\\proxy_watchdog.ps1\"\r\n"
+        "if errorlevel 20 exit /b 0\r\n"
     )
 
 

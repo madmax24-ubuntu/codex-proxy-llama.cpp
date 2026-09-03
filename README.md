@@ -62,6 +62,8 @@ Start the proxy on Windows:
 
 The Windows launcher supervises the proxy process. A single delayed health check does not restart it: recovery requires six consecutive failures plus a final ten-second probe. Actual process exits are restarted immediately.
 
+Compaction deterministically separates the newest user intent from system, developer, `AGENTS.md`, environment, and interruption envelopes. Short confirmations remain attached to the preceding actionable request. The proxy also reports a compact PATH capability baseline to the model and directs it to discover installed tools before creating replacement scripts or downloading software.
+
 In another PowerShell window, start Codex with the generated home:
 
 ```powershell

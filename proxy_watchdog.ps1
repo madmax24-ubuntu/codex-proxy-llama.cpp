@@ -16,6 +16,12 @@ $proxyPidFile = [IO.Path]::GetFullPath($env:PROXY_PID_FILE)
 $watchdogLog = if ($env:PROXY_WATCHDOG_LOG) { [IO.Path]::GetFullPath($env:PROXY_WATCHDOG_LOG) } else { Join-Path $env:CODEX_HOME 'proxy-watchdog.log' }
 $failureThreshold = 6
 if ($env:CODEX_PROXY_WATCHDOG_FAILURE_THRESHOLD) { $failureThreshold = [Math]::Max(2, [int]$env:CODEX_PROXY_WATCHDOG_FAILURE_THRESHOLD) }
+$mutexBytes = [Text.Encoding]::UTF8.GetBytes($proxyPidFile.ToLowerInvariant())
+$mutexHash = [Security.Cryptography.SHA256]::Create().ComputeHash($mutexBytes)
+$mutexId = -join ($mutexHash[0..11] | ForEach-Object { $_.ToString('x2') })
+$mutexCreated = $false
+$watchdogMutex = [Threading.Mutex]::new($true, "Local\CodexLlamaProxyWatchdog-$mutexId", [ref]$mutexCreated)
+if (-not $mutexCreated) { $watchdogMutex.Dispose(); exit 20 }
 
 function Write-WatchdogLog([string]$Message) {
     try { Add-Content -LiteralPath $watchdogLog -Value "[$([DateTime]::UtcNow.ToString('o'))] $Message" -Encoding UTF8 } catch { }
@@ -104,3 +110,6 @@ if ($seen) {
         $healthFailures = 0
     }
 }
+
+$watchdogMutex.ReleaseMutex()
+$watchdogMutex.Dispose()
