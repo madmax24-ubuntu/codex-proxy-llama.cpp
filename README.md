@@ -64,6 +64,8 @@ The Windows launcher supervises the proxy process. A single delayed health check
 
 Compaction deterministically separates the newest user intent from system, developer, `AGENTS.md`, environment, and interruption envelopes. Short confirmations remain attached to the preceding actionable request. The proxy also reports a compact PATH capability baseline to the model and directs it to discover installed tools before creating replacement scripts or downloading software.
 
+After compaction, newer user messages override the checkpoint baseline. A confirmation such as “continue” inherits the actionable task recorded in the checkpoint instead of replacing it.
+
 In another PowerShell window, start Codex with the generated home:
 
 ```powershell

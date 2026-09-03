@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.41";
+const VERSION = "1.0.42";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -1023,6 +1023,20 @@ function compactionHistoryWindow(body) {
   return items.slice(start);
 }
 
+function previousCheckpointTask(body) {
+  const items = Array.isArray(body?.input) ? body.input : [];
+  for (let i = items.length - 1; i >= 0; i--) {
+    if (!isCompactionSummaryItem(items[i])) continue;
+    const raw = messageContentText(items[i].content);
+    const metrics = compactionTextMetrics(checkpointSummaryText(raw) || raw);
+    const current = metrics.sections.get("CURRENT TASK") || "";
+    if (!current || /AGENTS\.md instructions|<INSTRUCTIONS>|<environment_context>|<turn_aborted>/i.test(current)) return "";
+    const anchored = current.match(/AUTHORITATIVE ACTIVE USER REQUEST:\s*([\s\S]*?)(?=\n-\s+(?:LATEST USER UPDATE|ACTIVE PLAN|COMPACTED TASK DETAILS):|$)/i)?.[1];
+    return memorySanitize((anchored || current).replace(/^[-*]\s*/, ""), COMPACT_TASK_ANCHOR_MAX_CHARS);
+  }
+  return "";
+}
+
 function buildCompactionContinuity(body) {
   const items = compactionHistoryWindow(body);
   const users = [];
@@ -1045,8 +1059,13 @@ function buildCompactionContinuity(body) {
   const latest = users.length ? users[users.length - 1] : null;
   let task = latest;
   if (latest && isContinuationOnlyUserUpdate(latest.text)) {
-    task = [...users.slice(0, -1)].reverse().find(entry => !isContinuationOnlyUserUpdate(entry.text)) || latest;
+    task = [...users.slice(0, -1)].reverse().find(entry => !isContinuationOnlyUserUpdate(entry.text)) || null;
   }
+  if (!task) {
+    const previousTask = previousCheckpointTask(body);
+    if (previousTask) task = { index: -1, text: previousTask };
+  }
+  if (!task) task = latest;
   const taskTokens = continuityTokens(task?.text);
   let plan = null;
   for (let i = 0; i < plans.length; i++) {
@@ -1332,7 +1351,8 @@ function appendPostCompactContinuationRule(body) {
   if (!body || typeof body !== "object" || !Array.isArray(body.input) || !body.input.some(isCompactionSummaryItem)) return false;
   const marker = "CRITICAL POST-COMPACTION CONTINUATION PROTOCOL:";
   const rule = `${marker}
-- The CONTEXT CHECKPOINT SUMMARY in history is the authoritative task state. Treat an item in WORK COMPLETED as finished when its recorded edit, result, test, or commit evidence supports it; never redo supported completed work.
+- The CONTEXT CHECKPOINT SUMMARY is the authoritative baseline at the moment it was created. Any real user message after that checkpoint overrides or updates it and has higher priority.
+- Treat an item in WORK COMPLETED as finished when its recorded edit, result, test, or commit evidence supports it; never redo supported completed work.
 - Older user messages prior to the checkpoint describe HISTORICAL starting problems. Everything listed in "WORK COMPLETED" has ALREADY been fixed, verified in code, and committed to git. DO NOT assume old complaints are still active if they are marked resolved in WORK COMPLETED.
 - DO NOT re-diagnose, re-analyze, or re-verify supported finished items unless the checkpoint marks them uncertain or the external state changed.
 - DO NOT start from scratch with general greetings or exploratory inspections (e.g. "Понял ситуацию, проведу диагностику").
@@ -3546,6 +3566,14 @@ function selftest() {
   if (!approvalContinuity.task.includes("Исправь компакцию") || approvalContinuity.latestUpdate !== "Да, делай") {
     throw new Error("continuation-only user update replaced the active task");
   }
+  const postCheckpointApproval = buildCompactionContinuity({ input: [
+    { role: "user", content: `${COMPACT_SUMMARY_PREFIXES[0]}\n${validCheckpoint.replace("Task.", "Исправить столкновения на арене.")}` },
+    { role: "user", content: "Да, делай" },
+    { role: "user", content: "You are performing a CONTEXT CHECKPOINT COMPACTION." }
+  ] });
+  if (!postCheckpointApproval.task.includes("Исправить столкновения") || postCheckpointApproval.latestUpdate !== "Да, делай") {
+    throw new Error("post-checkpoint confirmation lost the checkpoint task");
+  }
   const switchedPrepared = clone(switchedTaskRequest);
   applyCompactionPolicy(switchedPrepared, 4096, switchedContinuity);
   if (!switchedPrepared.instructions.includes("ACTION-SURVIVAL") || !messageContentText(switchedPrepared.input.at(-1).content).includes("ACTIVE PLAN")) {
@@ -3654,6 +3682,7 @@ function selftest() {
     throw new Error(`post-compaction tool output pruning failed: ${JSON.stringify(toolPrune)}`);
   }
   if (!appendPostCompactContinuationRule(postCompactTools) || appendPostCompactContinuationRule(postCompactTools) ||
+    !postCompactTools.instructions.includes("real user message after that checkpoint") ||
     !postCompactTools.instructions.includes("recorded edit, result, test, or commit evidence")) {
     throw new Error("post-compaction continuation rule failed");
   }
