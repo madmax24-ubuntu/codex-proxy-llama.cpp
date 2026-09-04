@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.45";
+const VERSION = "1.0.46";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -73,7 +73,9 @@ const MEMORY_BACKEND = String(process.env.CODEX_MEMORY_BACKEND || "json").toLowe
 const CHECKPOINT_BY_KEY = new Map();
 const CHECKPOINT_BY_SUMMARY = new Map();
 const MEMORY_INJECTED_TASKS = new Map();
+const MCP_TOOL_CACHE_FILE = process.env.CODEX_MCP_TOOL_CACHE || path.join(__dirname, "mcp-tool-cache.json");
 let MEMORY_STORE = null;
+let CACHED_MCP_NAMESPACES = [];
 
 function log(...a) { console.log("[codex-llama-proxy]", ...a); }
 function debug(...a) { if (DEBUG) console.log("[codex-llama-proxy:debug]", ...a); }
@@ -571,7 +573,44 @@ function toolMaps() {
 }
 
 function normalizeMcpServerName(name) {
-  return String(name || "").replace(/__$/, "").replace(/^mcp__/, "").toLowerCase();
+  return String(name || "").replace(/__$/, "").replace(/^mcp__/, "").replace(/-/g, "_").toLowerCase();
+}
+
+function restoreMcpToolCache() {
+  try {
+    const cached = JSON.parse(fs.readFileSync(MCP_TOOL_CACHE_FILE, "utf8"));
+    if (Array.isArray(cached)) {
+      const byName = new Map();
+      for (const tool of cached.filter(tool => tool?.type === "namespace" && typeof tool.name === "string")) {
+        const key = normalizeMcpServerName(tool.name);
+        const old = byName.get(key);
+        if (!old || (tool.tools?.length || 0) > (old.tools?.length || 0)) byName.set(key, tool);
+      }
+      CACHED_MCP_NAMESPACES = [...byName.values()];
+    }
+  } catch { }
+}
+
+function cacheMcpToolNamespaces(body) {
+  if (!Array.isArray(body?.tools)) return;
+  const current = body.tools.filter(tool => tool?.type === "namespace" && typeof tool.name === "string");
+  if (!current.length) return;
+  const byName = new Map(CACHED_MCP_NAMESPACES.map(tool => [normalizeMcpServerName(tool.name), tool]));
+  for (const tool of current) {
+    const key = normalizeMcpServerName(tool.name);
+    const old = byName.get(key);
+    if (!old || (tool.tools?.length || 0) >= (old.tools?.length || 0)) byName.set(key, clone(tool));
+  }
+  CACHED_MCP_NAMESPACES = [...byName.values()];
+  if (!process.argv.includes("--selftest")) {
+    try { fs.writeFileSync(MCP_TOOL_CACHE_FILE, JSON.stringify(CACHED_MCP_NAMESPACES)); } catch { }
+  }
+}
+
+function restoreMcpToolNamespaces(body) {
+  if (!Array.isArray(body?.tools) || !CACHED_MCP_NAMESPACES.length) return;
+  const attached = new Set(body.tools.filter(tool => tool?.type === "namespace").map(tool => normalizeMcpServerName(tool.name)));
+  for (const tool of CACHED_MCP_NAMESPACES) if (!attached.has(normalizeMcpServerName(tool.name))) body.tools.push(clone(tool));
 }
 
 function localPathFromResourceUri(uri) {
@@ -639,7 +678,14 @@ function makeFunctionFromCustom(tool, maps) {
 function rewriteTools(body, maps) {
   if (!Array.isArray(body.tools)) return;
 
+  cacheMcpToolNamespaces(body);
+  restoreMcpToolNamespaces(body);
   const out = [];
+  const codeGraphFunctions = body.tools
+    .filter(tool => tool && tool.type === "namespace" && normalizeMcpServerName(tool.name) === "codebase_memory_mcp")
+    .flatMap(tool => (Array.isArray(tool.tools) ? tool.tools : [])
+      .filter(inner => inner && inner.type === "function" && typeof inner.name === "string")
+      .map(inner => flatNs(tool.name, inner.name)));
 
   for (const tool of body.tools) {
     if (!tool || typeof tool !== "object") continue;
@@ -662,7 +708,11 @@ function rewriteTools(body, maps) {
           "Direct scripted writes are acceptable only for generated files or broad deterministic transformations; inspect git diff afterward. " +
           "Use this shell tool normally for reading/searching, git, tests, builds, diagnostics, package managers, and runtime work.";
 
-        f.description = patchGuide + (f.description ? "\n\n" + f.description : "");
+        const graphGate = codeGraphFunctions.length
+          ? ` SOURCE DISCOVERY GATE: Codebase Memory is attached to this request. Before using this shell tool to locate, read, or inspect source-code symbols, call one of these attached graph functions: ${codeGraphFunctions.join(", ")}. Do not claim that graph MCP is unavailable and do not use rg or file readers first; use them only after a graph result is insufficient.`
+          : "";
+
+        f.description = patchGuide + graphGate + (f.description ? "\n\n" + f.description : "");
       }
 
       if (f.name === "read_mcp_resource") {
@@ -981,6 +1031,15 @@ function isContinuationOnlyUserUpdate(text) {
   return /^(?:да|ок(?:ей)?|хорошо|делай|продолжай|согласен|верно|погоди|стоп|кстати|и\s+ещ[её]|ещ[её]|только\s+не|кроме|не\s+надо|готово|починил(?:а|и)?|исправил(?:а|и)?|сделал(?:а|и)?|перезапустил(?:а|и)?)(?=\s|[,.:;!?]|$)/iu.test(value);
 }
 
+function isTemporaryInterruption(text) {
+  const value = String(text || "").trim();
+  if (!value) return false;
+  const interruption = /(?:извини[^\n]{0,80}(?:прерв|переб)|(?:я\s+)?тебя\s+прерв|не\s+прерывая\s+(?:основн|текущ)|before\s+(?:you\s+)?continue|pause\s+(?:the\s+)?current\s+task)/iu.test(value);
+  const resume = /(?:потом|после\s+этого|затем)\s+(?:продолж|верн)|(?:и\s+)?(?:дальше|после)\s+(?:продолж|работ)|then\s+(?:resume|continue)|before\s+(?:you\s+)?continue/iu.test(value);
+  const maintenance = /(?:переиндекс|индексир|почин|проверь|настро|оптимиз|mcp|прокси|конфиг|лог|инструмент|reindex|index|repair|configure|diagnostic|tool)/iu.test(value);
+  return maintenance && (interruption || resume);
+}
+
 function compactionTextMetrics(text) {
   const clean = typeof text === "string" ? text.trim() : "";
   const canonical = clean.replace(/^#{1,6}\s*/, "");
@@ -1057,12 +1116,16 @@ function buildCompactionContinuity(body) {
     } catch { }
   }
   const latest = users.length ? users[users.length - 1] : null;
+  const previousTask = previousCheckpointTask(body);
   let task = latest;
-  if (latest && isContinuationOnlyUserUpdate(latest.text)) {
+  let temporaryUpdate = false;
+  if (latest && isTemporaryInterruption(latest.text) && previousTask) {
+    task = { index: -1, text: previousTask };
+    temporaryUpdate = true;
+  } else if (latest && isContinuationOnlyUserUpdate(latest.text)) {
     task = [...users.slice(0, -1)].reverse().find(entry => !isContinuationOnlyUserUpdate(entry.text)) || null;
   }
   if (!task) {
-    const previousTask = previousCheckpointTask(body);
     if (previousTask) task = { index: -1, text: previousTask };
   }
   if (!task) task = latest;
@@ -1080,6 +1143,7 @@ function buildCompactionContinuity(body) {
   return {
     task: task ? memorySanitize(task.text, COMPACT_TASK_ANCHOR_MAX_CHARS) : "",
     latestUpdate: latest && latest.index !== task?.index ? memorySanitize(latest.text, 1600) : "",
+    temporaryUpdate,
     plan: plan?.steps || [],
     activeStep: activeStep?.step || ""
   };
@@ -1092,7 +1156,7 @@ function compactionContinuityPrompt(continuity) {
     "System/developer/AGENTS/environment envelopes are policy context, never the user's active task.",
     `ACTIVE USER REQUEST: ${continuity.task}`
   ];
-  if (continuity.latestUpdate) lines.push(`LATEST USER UPDATE: ${continuity.latestUpdate}`);
+  if (continuity.latestUpdate) lines.push(`${continuity.temporaryUpdate ? "TEMPORARY INTERRUPTION (complete it once, then resume ACTIVE USER REQUEST; never promote it to the primary task)" : "LATEST USER UPDATE"}: ${continuity.latestUpdate}`);
   if (continuity.plan.length) {
     lines.push("ACTIVE PLAN:");
     for (const step of continuity.plan) lines.push(`- [${step.status || "pending"}] ${memorySanitize(step.step, 1000)}`);
@@ -1136,7 +1200,7 @@ function enforceCompactionContinuity(text, continuity) {
     : memorySanitize(generatedTask, 5000);
   const current = [
     `- AUTHORITATIVE ACTIVE USER REQUEST: ${continuity.task}`,
-    continuity.latestUpdate ? `- LATEST USER UPDATE: ${continuity.latestUpdate}` : "",
+    continuity.latestUpdate ? `- ${continuity.temporaryUpdate ? "TEMPORARY INTERRUPTION: выполнить не более одного раза и вернуться к основной задаче" : "LATEST USER UPDATE"}: ${continuity.latestUpdate}` : "",
     continuity.plan.length ? `- ACTIVE PLAN:\n${continuity.plan.map(step => `  - [${step.status || "pending"}] ${memorySanitize(step.step, 1000)}`).join("\n")}` : "",
     safeGeneratedTask && !safeGeneratedTask.includes(continuity.task) ? `- COMPACTED TASK DETAILS: ${safeGeneratedTask}` : ""
   ].filter(Boolean).join("\n");
@@ -3115,6 +3179,17 @@ function selftest() {
     shellTool.description.includes("Fallback form:")) {
     throw new Error("shell editing guidance injection failed");
   }
+  const graphShellPrepared = prepareRequest({
+    tools: [
+      { type: "function", name: "shell_command", description: "Run shell", parameters: { type: "object" } },
+      { type: "namespace", name: "mcp__codebase-memory-mcp", tools: [{ type: "function", name: "search_graph", parameters: { type: "object" } }] }
+    ]
+  });
+  const graphShellTool = graphShellPrepared.body.tools.find(x => x.name === "shell_command");
+  if (!graphShellTool?.description?.includes("Codebase Memory is attached") ||
+    !graphShellTool.description.includes("mcp__codebase-memory-mcp__search_graph")) {
+    throw new Error("code graph shell gate injection failed");
+  }
 
   if (!looksLikeDirectFileWrite('Set-Content -Path "x.js" -Value $code') ||
     !looksLikeDirectFileWrite('[System.IO.File]::WriteAllText("x.js", $code)') ||
@@ -3633,6 +3708,19 @@ function selftest() {
   if (!postCheckpointApproval.task.includes("Исправить столкновения") || postCheckpointApproval.latestUpdate !== "Да, делай") {
     throw new Error("post-checkpoint confirmation lost the checkpoint task");
   }
+  const temporaryMaintenanceContinuity = buildCompactionContinuity({ input: [
+    { role: "user", content: `${COMPACT_SUMMARY_PREFIXES[0]}\n${validCheckpoint.replace("Task.", "Завершить визуальную переработку трёх арен.")}` },
+    { role: "user", content: "Извини, я тебя прерву, но перед продолжением переиндексируй проект через MCP, затем продолжай работу" },
+    { type: "function_call", namespace: "mcp__codebase_memory_mcp", name: "index_repository", arguments: "{}" },
+    { type: "function_call_output", output: '{"status":"indexed"}' },
+    { type: "function_call", name: "exec_command", arguments: '{"cmd":"read arena.js"}' },
+    { role: "user", content: "You are performing a CONTEXT CHECKPOINT COMPACTION." }
+  ] });
+  if (!temporaryMaintenanceContinuity.task.includes("визуальную переработку трёх арен") ||
+      !temporaryMaintenanceContinuity.latestUpdate.includes("переиндексируй") ||
+      !temporaryMaintenanceContinuity.temporaryUpdate) {
+    throw new Error(`temporary maintenance replaced primary task: ${JSON.stringify(temporaryMaintenanceContinuity)}`);
+  }
   const switchedPrepared = clone(switchedTaskRequest);
   applyCompactionPolicy(switchedPrepared, 4096, switchedContinuity);
   if (!switchedPrepared.instructions.includes("ACTION-SURVIVAL") || !messageContentText(switchedPrepared.input.at(-1).content).includes("ACTIVE PLAN")) {
@@ -3868,6 +3956,7 @@ if (process.argv.includes("--selftest")) {
   process.exitCode = 0;
 } else {
   restoreCheckpointIndex();
+  restoreMcpToolCache();
   const server = createServer();
   server.on("error", err => {
     diag(`SERVER_ERROR code=${err.code || "unknown"} error=${err.message}`);

@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 checkpoints/
 memory/
+mcp-tool-cache.json
 generated/
 *.log
 *.pid
