@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "1.0.43"
+VERSION = "1.0.44"
 MARKER = "generated_by_codex_proxy_llama_cpp"
 
 
@@ -253,7 +253,6 @@ def render_catalog(settings: Settings) -> str:
         "priority": 0,
         "base_instructions": base_instructions(settings.language),
         "supports_tools": True,
-        "tool_mode": "direct",
         "supports_parallel_tool_calls": False,
         "experimental_supported_tools": [],
         "supports_reasoning_summaries": False,

@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.43";
+const VERSION = "1.0.44";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -1100,9 +1100,36 @@ function compactionContinuityPrompt(continuity) {
   return lines.join("\n");
 }
 
+function reconcileContinuityPlan(continuity, workCompleted) {
+  if (!continuity?.plan?.length) return continuity;
+  const lines = String(workCompleted || "").split(/\r?\n/).filter(line => {
+    const value = line.toLowerCase();
+    return /заверш|выполн|готов|закоммич|committ|complet|done|finish|implemented|verified/u.test(value) &&
+      !/не\s+(?:заверш|выполн|готов|закоммич|committ|complet|done|finish|implemented|verified)/u.test(value);
+  });
+  const plan = continuity.plan.map(step => {
+    if (step.status === "completed") return step;
+    const text = String(step.step || "");
+    const label = text.match(/(?:commit|коммит|step|шаг)\s*#?\s*(\d+)/iu);
+    const tokens = continuityTokens(text);
+    const completed = lines.some(line => {
+      const lineLabel = line.match(/(?:commit|коммит|step|шаг)\s*#?\s*(\d+)/iu);
+      if (label && lineLabel) return label[1] === lineLabel[1];
+      const lineTokens = continuityTokens(line);
+      let overlap = 0;
+      for (const token of tokens) if (lineTokens.has(token)) overlap++;
+      return overlap >= 3 && overlap / Math.max(1, tokens.size) >= 0.6;
+    });
+    return completed ? { ...step, status: "completed" } : step;
+  });
+  const activeStep = plan.find(step => step.status === "in_progress") || plan.find(step => step.status === "pending") || null;
+  return { ...continuity, plan, activeStep: activeStep?.step || "" };
+}
+
 function enforceCompactionContinuity(text, continuity) {
   const metrics = compactionTextMetrics(text);
   if (!continuity?.task || !isValidCompactionText(text)) return text;
+  continuity = reconcileContinuityPlan(continuity, metrics.sections.get("WORK COMPLETED"));
   const generatedTask = metrics.sections.get("CURRENT TASK") || "";
   const safeGeneratedTask = /AGENTS\.md instructions|<INSTRUCTIONS>|<environment_context>|<turn_aborted>/i.test(generatedTask)
     ? ""
@@ -1355,6 +1382,7 @@ function appendPostCompactContinuationRule(body) {
 - Treat an item in WORK COMPLETED as finished when its recorded edit, result, test, or commit evidence supports it; never redo supported completed work.
 - Older user messages prior to the checkpoint describe HISTORICAL starting problems. Everything listed in "WORK COMPLETED" has ALREADY been fixed, verified in code, and committed to git. DO NOT assume old complaints are still active if they are marked resolved in WORK COMPLETED.
 - DO NOT re-diagnose, re-analyze, or re-verify supported finished items unless the checkpoint marks them uncertain or the external state changed.
+- Files, functions, architecture, and tool results documented under WORK COMPLETED or STATE SNAPSHOT are already known. Do not reread entire files or repeat broad discovery after compaction; inspect only a precise missing range required for the next edit.
 - DO NOT start from scratch with general greetings or exploratory inspections (e.g. "Понял ситуацию, проведу диагностику").
 - Immediately execute the EXACT step described in "NEXT ACTION". Proceed with the remaining work autonomously until the overall user goal is 100% finished.`;
   const instructions = String(body.instructions || "").trim();
@@ -3545,11 +3573,41 @@ function selftest() {
   const guardedSwitch = finalizeCompactionText(staleButValid, buildCompactionRecoverySummary(switchedTaskRequest), false, switchedContinuity);
   const guardedMetrics = compactionTextMetrics(guardedSwitch);
   if (!isValidCompactionText(guardedSwitch) ||
-    !guardedMetrics.sections.get("CURRENT TASK").includes("ACTION-SURVIVAL") ||
-    !guardedMetrics.sections.get("CURRENT TASK").includes("Починил тебе MCP") ||
-    !guardedMetrics.sections.get("NEXT ACTION").includes("Проанализировать карту и боевую систему") ||
-    guardedMetrics.sections.get("NEXT ACTION").includes("smoke test")) {
+      !guardedMetrics.sections.get("CURRENT TASK").includes("ACTION-SURVIVAL") ||
+      !guardedMetrics.sections.get("CURRENT TASK").includes("Починил тебе MCP") ||
+      !guardedMetrics.sections.get("NEXT ACTION").includes("Проанализировать карту и боевую систему") ||
+      guardedMetrics.sections.get("NEXT ACTION").includes("smoke test")) {
     throw new Error(`active task continuity guard failed: ${JSON.stringify({ switchedContinuity, current: guardedMetrics.sections.get("CURRENT TASK"), next: guardedMetrics.sections.get("NEXT ACTION") })}`);
+  }
+  const completedPlanCheckpoint = `# CONTEXT CHECKPOINT SUMMARY
+## CURRENT TASK
+- Переработать оружие.
+## WORK COMPLETED
+- Commit 1 ЗАКОММИЧЕН как 85c08d9; проверки пройдены.
+## DECISIONS AND CONSTRAINTS
+- Сохранять изменения.
+## STATE SNAPSHOT
+- Дерево чистое.
+## OPEN ISSUES
+- Commit 2 не выполнен.
+## PARKED TASKS
+- Нет.
+## NEXT ACTION
+- Начать Commit 2.`;
+  const completedPlanContinuity = {
+    task: "Переработать оружие.",
+    latestUpdate: "",
+    plan: [
+      { step: "Commit 1: инфраструктура", status: "in_progress" },
+      { step: "Commit 2: визуальные эффекты", status: "pending" }
+    ],
+    activeStep: "Commit 1: инфраструктура"
+  };
+  const reconciledPlan = compactionTextMetrics(enforceCompactionContinuity(completedPlanCheckpoint, completedPlanContinuity));
+  if (!reconciledPlan.sections.get("CURRENT TASK").includes("[completed] Commit 1") ||
+      !reconciledPlan.sections.get("NEXT ACTION").includes("Commit 2") ||
+      reconciledPlan.sections.get("NEXT ACTION").includes("Commit 1")) {
+    throw new Error("completed plan step reconciliation failed");
   }
   const envelopedContinuity = buildCompactionContinuity({ input: [
     { role: "user", content: `# AGENTS.md instructions\n\n<INSTRUCTIONS>\n${"policy ".repeat(1200)}\n</INSTRUCTIONS>` },

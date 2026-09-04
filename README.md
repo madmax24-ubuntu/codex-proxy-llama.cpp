@@ -213,6 +213,8 @@ For a read-only server, add `"--retry-inflight"` before `"--"`. Prefer launching
 
 The supervisor aggregates paginated `tools/list` responses before returning the catalog to Codex and infers `readOnlyHint: true` for safe read-only tools when the upstream server omits annotations. This prevents non-interactive environments (`approval = "never"`) from silently hiding or blocking MCP tools. MCP resource listing is separate from callable tool discovery, so an empty resource list does not mean the server has no tools.
 
+The generated Codex configuration disables deferred MCP discovery for local models and leaves `tool_mode` unset. This keeps callable MCP namespaces visible to non-OpenAI models on current Codex builds. Restart Codex after changing these settings; an already-running or resumed legacy thread can retain its old tool catalog.
+
 Inspect or remove entries:
 
 ```bash

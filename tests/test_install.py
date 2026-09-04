@@ -32,7 +32,7 @@ class InstallerTests(unittest.TestCase):
             catalog = json.loads(install.render_catalog(self.settings(Path(temp))))
         model = catalog["models"][0]
         self.assertEqual(model["apply_patch_tool_type"], "freeform")
-        self.assertEqual(model["tool_mode"], "direct")
+        self.assertNotIn("tool_mode", model)
         self.assertEqual(model["effective_context_window_percent"], 95)
         self.assertEqual(model["supported_reasoning_levels"][-1]["effort"], "xhigh")
         self.assertIn("Before every commit or push", model["base_instructions"])
