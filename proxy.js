@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.44";
+const VERSION = "1.0.45";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -1420,7 +1420,7 @@ function appendCapabilityGuidance(body) {
 - list_mcp_resources and list_mcp_resource_templates enumerate resources, not callable MCP tools. Never use an empty resource list as evidence that a callable MCP namespace is unavailable.
 - PATH baseline detected at proxy startup: ${available}.
 - Before creating a helper script or downloading software for search, reading, inspection, conversion, or diagnostics, check existing software with Get-Command/where.exe on Windows or command -v on Unix.
-- Use code graph MCP tools first for definitions, implementations, callers, dependencies, and architecture. Use rg -n, rg --files, and native file-reading commands for literals, non-code files, or after the matching MCP tool is genuinely unavailable or insufficient. Do not create ad-hoc grep/read helper scripts.
+- SOURCE DISCOVERY GATE: when a code graph MCP namespace is attached and the request concerns source-code definitions, implementations, callers, dependencies, architecture, or locating a code symbol, the first discovery call MUST be a matching graph MCP tool (search_graph, trace_path, get_code_snippet, query_graph, or get_architecture). Do not use rg, Get-Content, cat, or an ad-hoc reader before that graph call. Use rg -n, rg --files, or native file reading only for exact literals, non-code files, or after the graph call returned no sufficient result; state that fallback reason briefly. After compaction, trust the checkpoint's completed work and use the graph first for only the missing symbol or range instead of reopening whole source files. Never claim graph MCP is unavailable without attempting its attached callable tool. Do not create ad-hoc grep/read helper scripts.
 - Full access permits task-scoped discovery and installation, but does not imply that every installed GUI program is pre-enumerated. Discover additional software only when the task needs it.`;
   body.instructions = instructions ? `${instructions}\n\n${rule}` : rule;
   return true;
@@ -3689,6 +3689,8 @@ function selftest() {
   }
   if (!mixedInstructions.body.instructions.includes("LOCAL CAPABILITY DISCOVERY PROTOCOL:") ||
       !mixedInstructions.body.instructions.includes("Get-Command/where.exe") ||
+      !mixedInstructions.body.instructions.includes("SOURCE DISCOVERY GATE:") ||
+      !mixedInstructions.body.instructions.includes("first discovery call MUST") ||
       !mixedInstructions.body.instructions.includes("rg --files")) {
     throw new Error("local capability discovery guidance missing");
   }
