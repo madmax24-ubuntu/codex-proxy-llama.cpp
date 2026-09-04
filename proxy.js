@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.46";
+const VERSION = "1.0.47";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -354,7 +354,7 @@ function checkpointForRequest(body, cacheKey, model) {
       if (hash && CHECKPOINT_BY_SUMMARY.has(hash)) return CHECKPOINT_BY_SUMMARY.get(hash);
     }
   }
-  return CHECKPOINT_BY_KEY.get(cacheKey) || CHECKPOINT_BY_KEY.get(`model:${model || DEFAULT_MODEL}`) || null;
+  return null;
 }
 
 function restoreCheckpointIndex(limit = 256) {
@@ -1040,6 +1040,14 @@ function isTemporaryInterruption(text) {
   return maintenance && (interruption || resume);
 }
 
+function scopedMaintenanceUpdate(text) {
+  const value = String(text || "").trim();
+  if (!value || !/(?:codebase[ -]?memory|knowledge graph|индекс|переиндекс)/iu.test(value)) return value;
+  if (!/(?:удал|remove|delete)/iu.test(value) || !/(?:проект|project|запис|индекс)/iu.test(value)) return value;
+  if (/(?:с диска|файл|папк|директор|filesystem|from disk|directory|folder)/iu.test(value)) return value;
+  return `${value}\n[SCOPE: удаление относится только к записи/индексу проекта в Codebase Memory. Не удалять каталог или файлы с диска.]`;
+}
+
 function compactionTextMetrics(text) {
   const clean = typeof text === "string" ? text.trim() : "";
   const canonical = clean.replace(/^#{1,6}\s*/, "");
@@ -1105,7 +1113,7 @@ function buildCompactionContinuity(body) {
     if (isUserMessageItem(item)) {
       const text = messageContentText(item.content).trim();
       if (text && !isUserControlEnvelope(text)) {
-        users.push({ index, text });
+        users.push({ index, text: scopedMaintenanceUpdate(text) });
       }
     }
     if (item?.type !== "function_call" || !/(?:^|__)update_plan$/i.test(String(item.name || ""))) continue;
@@ -1447,6 +1455,7 @@ function appendPostCompactContinuationRule(body) {
 - Older user messages prior to the checkpoint describe HISTORICAL starting problems. Everything listed in "WORK COMPLETED" has ALREADY been fixed, verified in code, and committed to git. DO NOT assume old complaints are still active if they are marked resolved in WORK COMPLETED.
 - DO NOT re-diagnose, re-analyze, or re-verify supported finished items unless the checkpoint marks them uncertain or the external state changed.
 - Files, functions, architecture, and tool results documented under WORK COMPLETED or STATE SNAPSHOT are already known. Do not reread entire files or repeat broad discovery after compaction; inspect only a precise missing range required for the next edit.
+- Scope destructive actions literally: removing a project/index mentioned together with an MCP means removing its MCP record only. Never delete filesystem files or directories unless the user explicitly requests filesystem deletion.
 - DO NOT start from scratch with general greetings or exploratory inspections (e.g. "Понял ситуацию, проведу диагностику").
 - Immediately execute the EXACT step described in "NEXT ACTION". Proceed with the remaining work autonomously until the overall user goal is 100% finished.`;
   const instructions = String(body.instructions || "").trim();
@@ -3597,6 +3606,11 @@ function selftest() {
   if (matchedCheckpoint !== "checkpoint-selftest.json") {
     throw new Error("checkpoint summary identity lookup failed");
   }
+  CHECKPOINT_BY_KEY.set(`model:${DEFAULT_MODEL}`, "stale-model-checkpoint.json");
+  if (checkpointForRequest({ input: [{ role: "user", content: wrappedCheckpoint.replace("Task.", "Different task.") }] }, "missing", DEFAULT_MODEL) !== null) {
+    throw new Error("stale model checkpoint contaminated an unrelated request");
+  }
+  CHECKPOINT_BY_KEY.delete(`model:${DEFAULT_MODEL}`);
   const recoverySummary = buildCompactionRecoverySummary({
     input: [{ role: "user", content: [{ type: "input_text", text: "Продолжить проверку проекта" }] }]
   });
@@ -3720,6 +3734,14 @@ function selftest() {
       !temporaryMaintenanceContinuity.latestUpdate.includes("переиндексируй") ||
       !temporaryMaintenanceContinuity.temporaryUpdate) {
     throw new Error(`temporary maintenance replaced primary task: ${JSON.stringify(temporaryMaintenanceContinuity)}`);
+  }
+  const scopedMaintenance = buildCompactionContinuity({ input: [
+    { role: "user", content: `${COMPACT_SUMMARY_PREFIXES[0]}\n${validCheckpoint.replace("Task.", "Завершить визуальную переработку трёх арен.")}` },
+    { role: "user", content: "Извини, я тебя прерву: через codebase memory старый проект new game удалить и добавить актуальный проект" },
+    { role: "user", content: "You are performing a CONTEXT CHECKPOINT COMPACTION." }
+  ] });
+  if (!scopedMaintenance.latestUpdate.includes("Не удалять каталог или файлы с диска")) {
+    throw new Error(`MCP maintenance scope was lost: ${JSON.stringify(scopedMaintenance)}`);
   }
   const switchedPrepared = clone(switchedTaskRequest);
   applyCompactionPolicy(switchedPrepared, 4096, switchedContinuity);
