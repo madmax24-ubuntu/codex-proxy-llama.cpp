@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.48";
+const VERSION = "1.0.50";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -40,7 +40,7 @@ const DEFAULT_MODEL = process.env.CODEX_MODEL || "llm";
 const DEBUG = /^(1|true|yes)$/i.test(process.env.CODEX_PROXY_DEBUG || "");
 const DIAG_PATH = process.env.CODEX_PROXY_DIAG || path.join(__dirname, "proxy.log");
 const POST_COMPACT_OLD_USER_TOKEN_LIMIT = Math.max(0, Number(process.env.CODEX_POST_COMPACT_OLD_USER_TOKEN_LIMIT || "0") || 0);
-const POST_COMPACT_TOOL_OUTPUT_MAX_CHARS = Math.max(1000, Number(process.env.CODEX_POST_COMPACT_TOOL_OUTPUT_MAX_CHARS || "4000") || 4000);
+const POST_COMPACT_TOOL_OUTPUT_MAX_CHARS = Math.max(400, Number(process.env.CODEX_POST_COMPACT_TOOL_OUTPUT_MAX_CHARS || "800") || 800);
 const POST_COMPACT_TOOL_OUTPUT_KEEP_RECENT = Math.max(1, Math.min(8, Number(process.env.CODEX_POST_COMPACT_TOOL_OUTPUT_KEEP_RECENT || "2") || 2));
 const COMPACT_MAX_OUTPUT_TOKENS = Math.max(1024, Number(process.env.CODEX_COMPACT_MAX_OUTPUT_TOKENS || "4096") || 4096);
 const COMPACT_REASONING_EFFORT = String(process.env.CODEX_COMPACT_REASONING_EFFORT || "low").toLowerCase();
@@ -1424,21 +1424,36 @@ function prunePostCompactionToolOutputs(body, maxChars = POST_COMPACT_TOOL_OUTPU
     outputs.push({ index, chars: item.output.length });
   }
   const protectedIndexes = new Set(outputs.slice(-keepRecent).map(item => item.index));
+  const totalLimit = maxChars * 8;
+  let retained = 0;
   let truncated = 0;
   let beforeChars = 0;
   let afterChars = 0;
   for (const entry of outputs) {
     const item = body.input[entry.index];
     beforeChars += entry.chars;
-    if (!protectedIndexes.has(entry.index) && entry.chars > maxChars) {
+    if (!protectedIndexes.has(entry.index) && (entry.chars > maxChars || retained + entry.chars > totalLimit)) {
       const digest = crypto.createHash("sha256").update(item.output).digest("hex").slice(0, 16);
       const marker = `\n...[POST-COMPACTION TOOL OUTPUT TRUNCATED sha256=${digest} original_chars=${entry.chars}]...\n`;
-      const available = Math.max(0, maxChars - marker.length);
+      const available = retained + entry.chars > totalLimit ? 0 : Math.max(0, maxChars - marker.length);
       const head = Math.floor(available * 0.75);
-      item.output = item.output.slice(0, head) + marker + item.output.slice(-(available - head));
+      const tail = available - head > 0 ? item.output.slice(-(available - head)) : "";
+      item.output = item.output.slice(0, head) + marker + tail;
       truncated++;
     }
+    if (!protectedIndexes.has(entry.index)) retained += item.output.length;
     afterChars += item.output.length;
+  }
+  for (const item of body.input) {
+    const itemIndex = body.input.indexOf(item);
+    if (protectedIndexes.has(itemIndex)) continue;
+    if (!item || item.type !== "function_call_output" || !Array.isArray(item.output)) continue;
+    const raw = item.output.map(block => typeof block === "string" ? block : block?.text || JSON.stringify(block)).join("\n");
+    if (raw.length <= maxChars) continue;
+    const available = retained + raw.length > totalLimit ? 0 : Math.max(0, maxChars - 64);
+    item.output = raw.slice(0, available) + "\n...[POST-COMPACTION ARRAY OUTPUT TRUNCATED]...";
+    retained += item.output.length;
+    truncated++;
   }
   return { foundSummary: true, truncated, beforeChars, afterChars };
 }
