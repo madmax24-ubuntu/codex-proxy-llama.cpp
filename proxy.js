@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.47";
+const VERSION = "1.0.48";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -1098,7 +1098,7 @@ function previousCheckpointTask(body) {
     const metrics = compactionTextMetrics(checkpointSummaryText(raw) || raw);
     const current = metrics.sections.get("CURRENT TASK") || "";
     if (!current || /AGENTS\.md instructions|<INSTRUCTIONS>|<environment_context>|<turn_aborted>/i.test(current)) return "";
-    const anchored = current.match(/AUTHORITATIVE ACTIVE USER REQUEST:\s*([\s\S]*?)(?=\n-\s+(?:LATEST USER UPDATE|ACTIVE PLAN|COMPACTED TASK DETAILS):|$)/i)?.[1];
+    const anchored = current.match(/AUTHORITATIVE ACTIVE USER REQUEST:\s*([\s\S]*?)(?=\n-\s+(?:LATEST USER UPDATE|TEMPORARY INTERRUPTION|ACTIVE PLAN|COMPACTED TASK DETAILS):|$)/i)?.[1];
     return memorySanitize((anchored || current).replace(/^[-*]\s*/, ""), COMPACT_TASK_ANCHOR_MAX_CHARS);
   }
   return "";
@@ -1141,10 +1141,11 @@ function buildCompactionContinuity(body) {
   let plan = null;
   for (let i = 0; i < plans.length; i++) {
     const candidate = plans[i];
+    if (task && task.index >= 0 && candidate.index < task.index) continue;
     const planTokens = continuityTokens(candidate.steps.map(step => step.step).join(" "));
     let overlap = 0;
     for (const token of planTokens) if (taskTokens.has(token)) overlap++;
-    const score = overlap * 1000 + i;
+    const score = i;
     if (!plan || score >= plan.score) plan = { ...candidate, score, overlap };
   }
   const activeStep = plan?.steps.find(step => step.status === "in_progress") || plan?.steps.find(step => step.status === "pending") || null;
@@ -1174,30 +1175,20 @@ function compactionContinuityPrompt(continuity) {
 
 function reconcileContinuityPlan(continuity, workCompleted) {
   if (!continuity?.plan?.length) return continuity;
-  const lines = String(workCompleted || "").split(/\r?\n/).filter(line => {
-    const value = line.toLowerCase();
-    return /заверш|выполн|готов|закоммич|committ|complet|done|finish|implemented|verified/u.test(value) &&
-      !/не\s+(?:заверш|выполн|готов|закоммич|committ|complet|done|finish|implemented|verified)/u.test(value);
-  });
+  const normalize = value => String(value || "").toLowerCase().replace(/[*_`]/g, "").replace(/\s+/g, " ").trim();
+  const lines = String(workCompleted || "").split(/\r?\n/).map(normalize);
   const plan = continuity.plan.map(step => {
     if (step.status === "completed") return step;
-    const text = String(step.step || "");
-    const label = text.match(/(?:commit|коммит|step|шаг)\s*#?\s*(\d+)/iu);
-    const tokens = continuityTokens(text);
-    const completed = lines.some(line => {
-      const lineLabel = line.match(/(?:commit|коммит|step|шаг)\s*#?\s*(\d+)/iu);
-      if (label && lineLabel) return label[1] === lineLabel[1];
-      const lineTokens = continuityTokens(line);
-      let overlap = 0;
-      for (const token of tokens) if (lineTokens.has(token)) overlap++;
-      return overlap >= 3 && overlap / Math.max(1, tokens.size) >= 0.6;
-    });
+    const title = normalize(step.step);
+    const completed = title.length >= 16 && lines.some(line =>
+      line.includes(title) &&
+      /(?:заверш|выполн|закоммич|completed|committed|implemented|verified)/u.test(line) &&
+      !/(?:не\s|not\s|pending|failed|провал|отклон|неуда)/u.test(line));
     return completed ? { ...step, status: "completed" } : step;
   });
   const activeStep = plan.find(step => step.status === "in_progress") || plan.find(step => step.status === "pending") || null;
   return { ...continuity, plan, activeStep: activeStep?.step || "" };
 }
-
 function enforceCompactionContinuity(text, continuity) {
   const metrics = compactionTextMetrics(text);
   if (!continuity?.task || !isValidCompactionText(text)) return text;
@@ -1214,11 +1205,17 @@ function enforceCompactionContinuity(text, continuity) {
   ].filter(Boolean).join("\n");
   const snapshot = [
     metrics.sections.get("STATE SNAPSHOT"),
-    "- PROXY CONTINUITY GUARD: CURRENT TASK and ACTIVE PLAN were restored deterministically from the newest pre-compaction history. They override conflicting older checkpoint text."
+    "- PROXY CONTINUITY GUARD: CURRENT TASK preserves the user request. ACTIVE PLAN is the last recorded plan and may lag behind tool results. Resolve contradictions using successful task-specific evidence; do not repeat completed discovery or assume a pending implementation is finished."
   ].filter(Boolean).join("\n");
-  const next = continuity.activeStep
-    ? `- Продолжить активный план с шага: ${memorySanitize(continuity.activeStep, 1200)} Не возвращаться к более старой задаче.`
-    : metrics.sections.get("NEXT ACTION");
+  const taskTokens = continuityTokens(continuity.task);
+  const generatedTokens = continuityTokens(generatedTask);
+  const overlap = [...taskTokens].filter(token => generatedTokens.has(token)).length;
+  const sameTask = overlap >= 2 && overlap / Math.max(1, Math.min(taskTokens.size, generatedTokens.size)) >= 0.5;
+  const next = sameTask && metrics.sections.get("NEXT ACTION")
+    ? metrics.sections.get("NEXT ACTION")
+    : continuity.activeStep
+      ? `- Продолжить активный план с шага: ${memorySanitize(continuity.activeStep, 1200)} Не возвращаться к более старой задаче.`
+      : metrics.sections.get("NEXT ACTION");
   const sections = new Map(metrics.sections);
   sections.set("CURRENT TASK", current);
   sections.set("STATE SNAPSHOT", snapshot);
@@ -1452,12 +1449,12 @@ function appendPostCompactContinuationRule(body) {
   const rule = `${marker}
 - The CONTEXT CHECKPOINT SUMMARY is the authoritative baseline at the moment it was created. Any real user message after that checkpoint overrides or updates it and has higher priority.
 - Treat an item in WORK COMPLETED as finished when its recorded edit, result, test, or commit evidence supports it; never redo supported completed work.
-- Older user messages prior to the checkpoint describe HISTORICAL starting problems. Everything listed in "WORK COMPLETED" has ALREADY been fixed, verified in code, and committed to git. DO NOT assume old complaints are still active if they are marked resolved in WORK COMPLETED.
+- WORK COMPLETED can contain investigation, failed attempts and older tasks. Only explicit successful evidence for the same task establishes completion. A matching commit number alone is not evidence. If the recorded plan is stale, use the latest successful results and NEXT ACTION; update the plan without repeating completed discovery.
 - DO NOT re-diagnose, re-analyze, or re-verify supported finished items unless the checkpoint marks them uncertain or the external state changed.
 - Files, functions, architecture, and tool results documented under WORK COMPLETED or STATE SNAPSHOT are already known. Do not reread entire files or repeat broad discovery after compaction; inspect only a precise missing range required for the next edit.
 - Scope destructive actions literally: removing a project/index mentioned together with an MCP means removing its MCP record only. Never delete filesystem files or directories unless the user explicitly requests filesystem deletion.
 - DO NOT start from scratch with general greetings or exploratory inspections (e.g. "Понял ситуацию, проведу диагностику").
-- Immediately execute the EXACT step described in "NEXT ACTION". Proceed with the remaining work autonomously until the overall user goal is 100% finished.`;
+- Continue from NEXT ACTION when consistent with the latest user request and tool results. Resolve contradictions with a targeted check, never a full restart of discovery. Reply to the user in Russian, including progress messages. Tool names and code remain unchanged.`;
   const instructions = String(body.instructions || "").trim();
   if (instructions.includes(marker)) return false;
   body.instructions = instructions ? `${instructions}\n\n${rule}` : rule;
@@ -3672,7 +3669,7 @@ function selftest() {
 ## CURRENT TASK
 - Переработать оружие.
 ## WORK COMPLETED
-- Commit 1 ЗАКОММИЧЕН как 85c08d9; проверки пройдены.
+- Commit 1: инфраструктура ЗАКОММИЧЕН как 85c08d9; проверки пройдены.
 ## DECISIONS AND CONSTRAINTS
 - Сохранять изменения.
 ## STATE SNAPSHOT
@@ -3693,6 +3690,15 @@ function selftest() {
     activeStep: "Commit 1: инфраструктура"
   };
   const reconciledPlan = compactionTextMetrics(enforceCompactionContinuity(completedPlanCheckpoint, completedPlanContinuity));
+  const unrelatedCompletion = reconcileContinuityPlan(completedPlanContinuity, "- Разведка для Commit 1 завершена.\n- Commit 1: старая задача ЗАКОММИЧЕН как abc1234.");
+  if (unrelatedCompletion.plan[0].status !== "in_progress") throw new Error("unrelated commit or investigation falsely completed implementation");
+  const failedCompletion = reconcileContinuityPlan(completedPlanContinuity, "- Commit 1: инфраструктура не завершена, патч отклонён.");
+  if (failedCompletion.plan[0].status !== "in_progress") throw new Error("failed patch falsely completed implementation");
+  const negatedCompletion = reconcileContinuityPlan(completedPlanContinuity, "- Commit 1: инфраструктура не завершена.\n- Другая задача completed.");
+  if (negatedCompletion.plan[0].status !== "in_progress") throw new Error("negation or adjacent completion contaminated plan status");
+  const staleDiscovery = { ...completedPlanContinuity, plan: [{ step: "Разведка проекта", status: "in_progress" }], activeStep: "Разведка проекта" };
+  const discoveryResult = compactionTextMetrics(enforceCompactionContinuity(completedPlanCheckpoint, staleDiscovery));
+  if (!discoveryResult.sections.get("NEXT ACTION").includes("Начать Commit 2")) throw new Error("stale plan overwrote fresh next action");
   if (!reconciledPlan.sections.get("CURRENT TASK").includes("[completed] Commit 1") ||
       !reconciledPlan.sections.get("NEXT ACTION").includes("Commit 2") ||
       reconciledPlan.sections.get("NEXT ACTION").includes("Commit 1")) {
