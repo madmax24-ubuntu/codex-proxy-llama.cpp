@@ -66,7 +66,7 @@ Start the proxy on Windows:
 
 The Windows launcher supervises the proxy process. A single delayed health check does not restart it: recovery requires six consecutive failures plus a final ten-second probe. Actual process exits are restarted immediately.
 
-Compaction deterministically separates the newest user intent from system, developer, `AGENTS.md`, environment, and interruption envelopes. Short confirmations remain attached to the preceding actionable request. The proxy also reports a compact PATH capability baseline to the model and directs it to discover installed tools before creating replacement scripts or downloading software.
+Compaction deterministically separates the newest user intent from system, developer, `AGENTS.md`, environment, and interruption envelopes. Short confirmations remain attached to the preceding actionable request. Recent source and graph outputs are retained newest-first in a budget separate from ordinary tool output, while oversized individual results are shortened with an explicit no-reread marker. The proxy also reports a compact PATH capability baseline to the model and directs it to discover installed tools before creating replacement scripts or downloading software.
 
 After compaction, newer user messages override the checkpoint baseline. A confirmation such as “continue” inherits the actionable task recorded in the checkpoint instead of replacing it.
 
@@ -194,7 +194,7 @@ The installer creates:
 
 ## Episodic memory
 
-The proxy automatically remembers a completed task only when its history contains test or commit evidence. Memories are isolated by workspace, deduplicated, redacted before writing, and reused in later sessions only when their terms overlap the current request. At most three entries and 1200 characters are injected once per task; memory injection is suppressed after compaction and when the user reports that an earlier result regressed or failed.
+The proxy automatically remembers a completed task only when its history contains test or commit evidence. Memories are isolated by workspace, deduplicated, redacted before writing, and reused in later sessions only when their terms overlap the current request. At most three entries and 1200 characters are injected once per task, including after compaction when relevant; injection is suppressed when the user reports that an earlier result regressed or failed.
 
 By default data is stored atomically in readable `memory/memory.json`, with a second `memory-backup.json` export. Set `CODEX_MEMORY_BACKEND=sqlite` to use the built-in `node:sqlite` backend on a Node.js version that provides it.
 
@@ -244,13 +244,13 @@ node proxy.js --memory-forget MEMORY_ID
 | `CODEX_UPSTREAM_RETRY_MAX_MS` | Maximum reconnect delay | `10000` |
 | `CODEX_UPSTREAM_IDLE_TIMEOUT_MS` | Reconnect when upstream sends no data for this interval | `300000` |
 | `CODEX_DOWNSTREAM_HEARTBEAT_MS` | Emit Responses events while llama.cpp is still processing | `30000` |
-| `CODEX_REPEAT_GUARD_THRESHOLD` | Force a new strategy after equivalent consecutive tool results | `3` |
+| `CODEX_REPEAT_GUARD_THRESHOLD` | Force a new strategy after the same call returns the same result repeatedly within the active task | `3` |
 | `CODEX_COMPACT_MAX_OUTPUT_TOKENS` | Compaction output cap | `4096` |
 | `CODEX_COMPACT_TASK_ANCHOR_MAX_CHARS` | Maximum authoritative active-task text preserved in every checkpoint | `8000` |
 | `CODEX_POST_COMPACT_OLD_USER_TOKEN_LIMIT` | Token budget for superseded user requests kept after compaction | `0` |
 | `CODEX_POST_COMPACT_TOOL_OUTPUT_MAX_CHARS` | Maximum retained characters in each older tool output after compaction | `4000` |
 | `CODEX_POST_COMPACT_SOURCE_OUTPUT_MAX_CHARS` | Maximum retained characters for source-code and graph outputs after compaction | `12000` |
-| `CODEX_POST_COMPACT_SOURCE_TOTAL_CHARS` | Total budget reserved for source-code and graph outputs after compaction | `60000` |
+| `CODEX_POST_COMPACT_SOURCE_TOTAL_CHARS` | Newest-first budget reserved separately for source-code and graph outputs after compaction | `60000` |
 | `CODEX_POST_COMPACT_TOOL_OUTPUT_KEEP_RECENT` | Recent tool outputs kept in full after compaction | `2` |
 | `CODEX_FORWARD_TOOL_PROGRESS` | Forward concise assistant updates before tool calls | `1` |
 | `CODEX_PROGRESS_MAX_CHARS` | Maximum length of a forwarded tool-progress update | `1200` |
