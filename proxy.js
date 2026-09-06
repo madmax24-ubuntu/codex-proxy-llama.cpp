@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.57";
+const VERSION = "1.0.58";
 const SELFTEST_MODE = process.argv.includes("--selftest");
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
@@ -857,16 +857,12 @@ function isPollingToolCall(identity) {
 function repeatedToolCallRecovery(body, threshold = REPEAT_GUARD_THRESHOLD) {
   if (!Array.isArray(body?.input)) return null;
   const pending = new Map();
-  let lastSignature = "";
-  let lastOutcome = "";
-  let count = 0;
+  const seen = new Map();
   let latest = null;
   for (const item of body.input) {
     if (!item || typeof item !== "object") continue;
     if ((item.role === "user" || item.type === "input_text") && item.type !== "function_call_output" && item.type !== "custom_tool_call_output") {
-      lastSignature = "";
-      lastOutcome = "";
-      count = 0;
+      seen.clear();
       latest = null;
       continue;
     }
@@ -879,16 +875,13 @@ function repeatedToolCallRecovery(body, threshold = REPEAT_GUARD_THRESHOLD) {
     if (item.type !== "function_call_output" && item.type !== "custom_tool_call_output") continue;
     const identityForOutput = pending.get(item.call_id || item.id);
     if (!identityForOutput || isPollingToolCall(identityForOutput)) {
-      lastSignature = "";
-      lastOutcome = "";
-      count = 0;
       latest = null;
       continue;
     }
     const outcome = canonicalToolOutcome(item);
-    count = identityForOutput.signature === lastSignature && outcome === lastOutcome ? count + 1 : 1;
-    lastSignature = identityForOutput.signature;
-    lastOutcome = outcome;
+    const key = `${identityForOutput.signature}\n${crypto.createHash("sha256").update(outcome).digest("hex")}`;
+    const count = (seen.get(key) || 0) + 1;
+    seen.set(key, count);
     latest = { name: identityForOutput.name, signature: identityForOutput.signature, count, outcome };
   }
   return latest && latest.count >= threshold ? latest : null;
@@ -1432,44 +1425,40 @@ function prunePostCompactionToolOutputs(body, maxChars = POST_COMPACT_TOOL_OUTPU
   };
   for (let index = 0; index < body.input.length; index++) {
     const item = body.input[index];
-    if (!item || !["function_call_output", "custom_tool_call_output"].includes(item.type) || typeof item.output !== "string") continue;
+    if (!item || !["function_call_output", "custom_tool_call_output"].includes(item.type)) continue;
+    if (Array.isArray(item.output)) item.output = item.output.map(block => typeof block === "string" ? block : block?.text || JSON.stringify(block)).join("\n");
+    if (typeof item.output !== "string") continue;
     outputs.push({ index, chars: item.output.length, source: sourceCall(index) });
   }
   const protectedIndexes = new Set(outputs.slice(-keepRecent).map(item => item.index));
   const totalLimit = maxChars * 8;
-  let retained = 0;
+  const retained = { source: 0, ordinary: 0 };
   let truncated = 0;
-  let beforeChars = 0;
+  const beforeChars = outputs.reduce((sum, entry) => sum + entry.chars, 0);
   let afterChars = 0;
-  for (const entry of outputs) {
+  for (const entry of [...outputs].reverse()) {
     const item = body.input[entry.index];
-    beforeChars += entry.chars;
+    if (protectedIndexes.has(entry.index)) {
+      afterChars += item.output.length;
+      continue;
+    }
+    const bucket = entry.source ? "source" : "ordinary";
     const entryLimit = entry.source ? POST_COMPACT_SOURCE_OUTPUT_MAX_CHARS : maxChars;
     const entryTotal = entry.source ? POST_COMPACT_SOURCE_TOTAL_CHARS : totalLimit;
-    if (!protectedIndexes.has(entry.index) && (entry.chars > entryLimit || retained + entry.chars > entryTotal)) {
+    const remaining = Math.max(0, entryTotal - retained[bucket]);
+    if (entry.chars > entryLimit || entry.chars > remaining) {
       const digest = crypto.createHash("sha256").update(item.output).digest("hex").slice(0, 16);
-      const marker = `\n...[POST-COMPACTION TOOL OUTPUT TRUNCATED sha256=${digest} original_chars=${entry.chars}]...\n`;
-      const available = retained + entry.chars > entryTotal ? 0 : Math.max(0, entryLimit - marker.length);
+      const marker = `\n...[POST-COMPACTION ${entry.source ? "SOURCE" : "TOOL"} OUTPUT TRUNCATED sha256=${digest} original_chars=${entry.chars}; do not repeat the call solely because this payload was compacted]...\n`;
+      const available = Math.max(0, Math.min(entryLimit, remaining) - marker.length);
       const head = Math.floor(available * 0.75);
       const tail = available - head > 0 ? item.output.slice(-(available - head)) : "";
       item.output = item.output.slice(0, head) + marker + tail;
       truncated++;
     }
-    if (!protectedIndexes.has(entry.index)) retained += item.output.length;
+    retained[bucket] += item.output.length;
     afterChars += item.output.length;
   }
-  for (const item of body.input) {
-    const itemIndex = body.input.indexOf(item);
-    if (protectedIndexes.has(itemIndex)) continue;
-    if (!item || item.type !== "function_call_output" || !Array.isArray(item.output)) continue;
-    const raw = item.output.map(block => typeof block === "string" ? block : block?.text || JSON.stringify(block)).join("\n");
-    if (raw.length <= maxChars) continue;
-    const available = retained + raw.length > totalLimit ? 0 : Math.max(0, maxChars - 64);
-    item.output = raw.slice(0, available) + "\n...[POST-COMPACTION ARRAY OUTPUT TRUNCATED]...";
-    retained += item.output.length;
-    truncated++;
-  }
-  return { foundSummary: true, truncated, beforeChars, afterChars };
+  return { foundSummary: true, truncated, beforeChars, afterChars, retainedSourceChars: retained.source, retainedToolChars: retained.ordinary };
 }
 
 function appendPostCompactContinuationRule(body) {
@@ -3954,6 +3943,21 @@ function selftest() {
     !postCompactTools.input[1].output.includes("POST-COMPACTION TOOL OUTPUT TRUNCATED")) {
     throw new Error(`post-compaction tool output pruning failed: ${JSON.stringify(toolPrune)}`);
   }
+  const sourceRetention = { input: [{ role: "user", content: summaryPrefix + "\ncompact summary" }] };
+  sourceRetention.input.push({ type: "function_call", call_id: "ordinary", name: "exec_command", arguments: JSON.stringify({ cmd: "npm test" }) });
+  sourceRetention.input.push({ type: "function_call_output", call_id: "ordinary", output: "T".repeat(30000) });
+  for (let index = 0; index < 8; index++) {
+    sourceRetention.input.push({ type: "function_call", call_id: `source-${index}`, name: "exec_command", arguments: JSON.stringify({ cmd: `node -e \"fs.readFileSync('src/large.js').slice(${index * 100},${index * 100 + 100})\"` }) });
+    sourceRetention.input.push({ type: "function_call_output", call_id: `source-${index}`, output: String(index).repeat(11000) });
+  }
+  const sourcePrune = prunePostCompactionToolOutputs(sourceRetention, 4000, 2);
+  const sourceOutputs = sourceRetention.input.filter(item => /^source-/.test(item.call_id || "") && item.type === "function_call_output");
+  if (sourceRetention.input[2].output.length !== 4000 || sourceOutputs[0].output.length >= 11000 ||
+    sourceOutputs.slice(1).some(item => item.output.length !== 11000) ||
+    !sourceOutputs[0].output.includes("POST-COMPACTION SOURCE OUTPUT TRUNCATED") ||
+    sourcePrune.retainedSourceChars < 55000 || sourcePrune.retainedToolChars !== 4000) {
+    throw new Error(`post-compaction source retention failed: ${JSON.stringify(sourcePrune)}`);
+  }
   if (!appendPostCompactContinuationRule(postCompactTools) || appendPostCompactContinuationRule(postCompactTools) ||
     !postCompactTools.instructions.includes("real user message after that checkpoint") ||
     !postCompactTools.instructions.includes("recorded edit, result, test, or commit evidence")) {
@@ -3985,6 +3989,19 @@ function selftest() {
   const changedRepeat = clone({ model: "llm", input: repeatedInput });
   changedRepeat.input.at(-2).arguments = JSON.stringify({ cmd: "python crop.py --verify" });
   if (prepareRequest(changedRepeat).repeatGuard) throw new Error("repeat recovery ignored changed arguments");
+  const interleavedRepeat = [{ role: "user", content: "Inspect the source" }];
+  for (let i = 1; i <= 3; i++) {
+    interleavedRepeat.push({ type: "function_call", call_id: `read-${i}`, name: "exec_command", arguments: JSON.stringify({ cmd: "Get-Content src/large.js -TotalCount 200" }) });
+    interleavedRepeat.push({ type: "function_call_output", call_id: `read-${i}`, output: "same source payload" });
+    if (i < 3) {
+      interleavedRepeat.push({ type: "function_call", call_id: `other-${i}`, name: "exec_command", arguments: JSON.stringify({ cmd: `rg symbol-${i} src` }) });
+      interleavedRepeat.push({ type: "function_call_output", call_id: `other-${i}`, output: `different result ${i}` });
+    }
+  }
+  const interleavedPrepared = prepareRequest({ model: "llm", input: interleavedRepeat });
+  if (interleavedPrepared.repeatGuard?.count !== 3 || !interleavedPrepared.body.instructions.includes("REPEAT RECOVERY GUARD")) {
+    throw new Error("interleaved repeat recovery guard failed");
+  }
   const pollingInput = [{ role: "user", content: "Wait for completion" }];
   for (let i = 1; i <= 3; i++) {
     pollingInput.push({ type: "function_call", call_id: `poll-${i}`, name: "write_stdin", arguments: JSON.stringify({ session_id: 7 }) });
