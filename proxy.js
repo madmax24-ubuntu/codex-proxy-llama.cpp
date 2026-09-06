@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.58";
+const VERSION = "1.0.59";
 const SELFTEST_MODE = process.argv.includes("--selftest");
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
@@ -579,17 +579,24 @@ function normalizeMcpServerName(name) {
   return String(name || "").replace(/__$/, "").replace(/^mcp__/, "").replace(/-/g, "_").toLowerCase();
 }
 
+function isSyntheticMcpCacheEntry(tool) {
+  return normalizeMcpServerName(tool?.name) === "demo" && tool?.description === "demo" &&
+    Array.isArray(tool?.tools) && tool.tools.length === 1 && tool.tools[0]?.name === "ping";
+}
+
 function restoreMcpToolCache() {
   try {
     const cached = JSON.parse(fs.readFileSync(MCP_TOOL_CACHE_FILE, "utf8"));
     if (Array.isArray(cached)) {
       const byName = new Map();
-      for (const tool of cached.filter(tool => tool?.type === "namespace" && typeof tool.name === "string")) {
+      const valid = cached.filter(tool => tool?.type === "namespace" && typeof tool.name === "string" && !isSyntheticMcpCacheEntry(tool));
+      for (const tool of valid) {
         const key = normalizeMcpServerName(tool.name);
         const old = byName.get(key);
         if (!old || (tool.tools?.length || 0) > (old.tools?.length || 0)) byName.set(key, tool);
       }
       CACHED_MCP_NAMESPACES = [...byName.values()];
+      if (valid.length !== cached.length) diag(`MCP_CACHE removed_synthetic=${cached.length - valid.length}`);
     }
   } catch { }
 }
@@ -3152,6 +3159,10 @@ function selftest() {
   }
   if (!p.body.tools.find(x => x.name === "mcp__demo__ping")) {
     throw new Error("namespace flatten failed");
+  }
+  if (!isSyntheticMcpCacheEntry({ type: "namespace", name: "mcp__demo", description: "demo", tools: [{ name: "ping" }] }) ||
+    isSyntheticMcpCacheEntry({ type: "namespace", name: "mcp__codebase_memory_mcp", description: "Tools", tools: [{ name: "ping" }] })) {
+    throw new Error("synthetic MCP cache filtering failed");
   }
   if (p.body.tools.some(x => x.type === "web_search")) {
     throw new Error("web_search removal failed");
