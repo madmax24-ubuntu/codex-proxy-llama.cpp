@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.53";
+const VERSION = "1.0.54";
 const SELFTEST_MODE = process.argv.includes("--selftest");
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
@@ -1938,6 +1938,12 @@ function memoryTaskInfo(body) {
       text.startsWith("# CONTEXT CHECKPOINT SUMMARY")) continue;
     return { index, id: item.id || item.internal_chat_message_metadata_passthrough?.turn_id || "", text: memorySanitize(text, 1400) };
   }
+  for (let index = items.length - 1; index >= 0; index--) {
+    const item = items[index];
+    if (!isCompactionSummaryItem(item)) continue;
+    const current = compactionTextMetrics(messageContentText(item.content)).sections.get("CURRENT TASK") || "";
+    if (current.trim()) return { index, id: item.id || `checkpoint-${index}`, text: memorySanitize(current, 1400) };
+  }
   return { index: -1, id: "", text: "" };
 }
 
@@ -1996,7 +2002,6 @@ function memoryRequestMeta(body) {
 function memoryInstructionForRequest(body) {
   const meta = memoryRequestMeta(body);
   if (!MEMORY_ENABLED || isCompactionRequest(body) || !meta.task ||
-      (Array.isArray(body?.input) && body.input.some(isCompactionSummaryItem)) ||
       memoryHasRegressionSignal(meta.task) || MEMORY_INJECTED_TASKS.has(meta.taskKey)) {
     return { block: "", meta, count: 0 };
   }
@@ -4006,14 +4011,11 @@ function selftest() {
     });
     const compactedMemoryRequest = memoryInstructionForRequest({
       instructions: "<environment_context><cwd>C:/work/rublox</cwd></environment_context>",
-      input: [
-        { id: "memory-task-3", role: "user", content: "Fix another BotBrain JavaScript syntax error" },
-        { role: "user", content: summaryPrefix + "\ncompact summary" }
-      ]
+      input: [{ role: "user", content: `${summaryPrefix}\n## CURRENT TASK\nFix another BotBrain JavaScript syntax error` }]
     });
     MEMORY_STORE = priorMemoryStore;
     MEMORY_INJECTED_TASKS.clear();
-    if (repeatedRequest.count || regressionRequest.count || compactedMemoryRequest.count) {
+    if (repeatedRequest.count || regressionRequest.count || compactedMemoryRequest.count !== 1) {
       throw new Error("episodic memory repeat/regression/post-compaction guard failed");
     }
     const memoryMeta = memoryRequestMeta({ input: [
