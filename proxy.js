@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.51";
+const VERSION = "1.0.52";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -2291,11 +2291,9 @@ class SseTranslator {
     this.normalizeEventShape(evt);
 
     let syntheticFunctionAdded = null;
-    if ((evt.type === "response.function_call_arguments.delta" ||
-         evt.type === "response.function_call_arguments.done" ||
-         evt.type === "response.output_item.done") &&
-        evt.item?.type !== "custom_tool_call" &&
-        evt.item?.type !== "message") {
+    const orphanFunctionDone = evt.type === "response.output_item.done" && evt.item?.type === "function_call";
+    if (evt.type === "response.function_call_arguments.delta" ||
+        evt.type === "response.function_call_arguments.done" || orphanFunctionDone) {
       const item = evt.item;
       const id = evt.item_id || item?.id || item?.call_id || evt.call_id;
       const name = item?.name;
