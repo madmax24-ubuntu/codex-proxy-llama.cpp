@@ -36,6 +36,10 @@ Codex expects more than basic OpenAI-compatible chat completions. Agentic sessio
 
 The proxy cannot add tool-calling ability to a model that does not have it. Models trained for agentic coding and tool use work best.
 
+## Tested Codex compatibility
+
+This release is tested with the portable Codex IDE extension `openai.chatgpt-26.825.51511` on Windows. Compatibility with other Codex versions, including newer or older builds, is not guaranteed; changes in Responses events, tool state, or diff handling may require proxy updates.
+
 ## Quick start
 
 Start llama.cpp first. A typical command is:
@@ -244,7 +248,7 @@ node proxy.js --memory-forget MEMORY_ID
 | `CODEX_COMPACT_MAX_OUTPUT_TOKENS` | Compaction output cap | `4096` |
 | `CODEX_COMPACT_TASK_ANCHOR_MAX_CHARS` | Maximum authoritative active-task text preserved in every checkpoint | `8000` |
 | `CODEX_POST_COMPACT_OLD_USER_TOKEN_LIMIT` | Token budget for superseded user requests kept after compaction | `0` |
-| `CODEX_POST_COMPACT_TOOL_OUTPUT_MAX_CHARS` | Maximum retained characters in each older tool output after compaction | `4000` |
+| `CODEX_POST_COMPACT_TOOL_OUTPUT_MAX_CHARS` | Maximum retained characters in each older tool output after compaction | `800` |
 | `CODEX_POST_COMPACT_TOOL_OUTPUT_KEEP_RECENT` | Recent tool outputs kept in full after compaction | `2` |
 | `CODEX_FORWARD_TOOL_PROGRESS` | Forward concise assistant updates before tool calls | `1` |
 | `CODEX_PROGRESS_MAX_CHARS` | Maximum length of a forwarded tool-progress update | `1200` |

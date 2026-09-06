@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.50";
+const VERSION = "1.0.51";
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -2133,6 +2133,8 @@ class SseTranslator {
     this.requestMeta = requestMeta;
     this.customItems = new Map(); // item_id -> { name, args, output_index, call_id }
     this.resourceItems = new Map();
+    this.functionItems = new Map();
+    this.functionAdded = new Set();
     this.outputIndexByItem = new Map();
     this.nextOutputIndex = 0;
     this.text = "";
@@ -2227,6 +2229,24 @@ class SseTranslator {
     const isFunctionArgs = evt.type === "response.function_call_arguments.delta" ||
       evt.type === "response.function_call_arguments.done";
 
+    if (isFunctionAdded || isFunctionDone || isFunctionArgs) {
+      const item = evt.item;
+      const rawId = evt.item_id || item?.id || item?.call_id || evt.call_id;
+      const callId = evt.call_id || item?.call_id || rawId;
+      const knownId = callId && this.functionItems.get(callId);
+      const id = knownId || rawId;
+      if (id && callId) this.functionItems.set(callId, id);
+      if (isFunctionAdded && id) this.functionAdded.add(id);
+      if (item && id) {
+        item.id = id;
+        item.call_id = callId || id;
+      }
+      if (isFunctionArgs && id) {
+        evt.item_id = id;
+        evt.call_id = callId || id;
+      }
+    }
+
     // Only normalize indices on function-call protocol events. Reasoning and
     // assistant text events are otherwise forwarded without shape changes.
     if (isFunctionAdded) {
@@ -2269,6 +2289,32 @@ class SseTranslator {
     }
 
     this.normalizeEventShape(evt);
+
+    let syntheticFunctionAdded = null;
+    if ((evt.type === "response.function_call_arguments.delta" ||
+         evt.type === "response.function_call_arguments.done" ||
+         evt.type === "response.output_item.done") &&
+        evt.item?.type !== "custom_tool_call" &&
+        evt.item?.type !== "message") {
+      const item = evt.item;
+      const id = evt.item_id || item?.id || item?.call_id || evt.call_id;
+      const name = item?.name;
+      if (id && !this.functionAdded.has(id) && !this.maps.customByName.has(name)) {
+        this.functionAdded.add(id);
+        syntheticFunctionAdded = this.event({
+          type: "response.output_item.added",
+          output_index: finiteInt(evt.output_index) ?? this.outputIndexByItem.get(id) ?? 0,
+          item: {
+            id,
+            call_id: evt.call_id || item?.call_id || id,
+            type: "function_call",
+            name: name || "unknown_tool",
+            arguments: ""
+          }
+        });
+        diag(`SSE_REPAIR synthetic function_call added item_id=${id}`);
+      }
+    }
 
     if (this.heartbeatCreatedForwarded) {
       if (evt.response && typeof evt.response === "object") evt.response.id = this.transportResponseId;
@@ -2486,7 +2532,7 @@ class SseTranslator {
       diag(`${kind}; ${detail}`);
     }
 
-    return [this.event(evt)];
+    return syntheticFunctionAdded ? [syntheticFunctionAdded, this.event(evt)] : [this.event(evt)];
   }
 }
 
@@ -3442,6 +3488,21 @@ function selftest() {
   }));
   if (!progressCompleted.join("").includes('"type":"response.completed"')) {
     throw new Error("progress-only response.completed was swallowed");
+  }
+
+  const orphanFunction = new SseTranslator(p.maps);
+  const orphanEvents = parseSseJsonEvents(orphanFunction.translate("data: " + JSON.stringify({
+    type: "response.function_call_arguments.done",
+    item_id: "orphan_item",
+    call_id: "orphan_call",
+    output_index: 0,
+    arguments: "{}"
+  })));
+  if (orphanEvents[0]?.type !== "response.output_item.added" ||
+      orphanEvents[0]?.item?.id !== "orphan_item" ||
+      orphanEvents[1]?.type !== "response.function_call_arguments.done" ||
+      orphanEvents[1]?.item_id !== "orphan_item") {
+    throw new Error("orphan function_call item repair failed");
   }
 
   const toolChatter = new SseTranslator(p.maps);
