@@ -251,6 +251,7 @@ node proxy.js --memory-forget MEMORY_ID
 | `CODEX_POST_COMPACT_TOOL_OUTPUT_MAX_CHARS` | Maximum retained characters in each older tool output after compaction | `4000` |
 | `CODEX_POST_COMPACT_SOURCE_OUTPUT_MAX_CHARS` | Maximum retained characters for source-code and graph outputs after compaction | `12000` |
 | `CODEX_POST_COMPACT_SOURCE_TOTAL_CHARS` | Newest-first budget reserved separately for source-code and graph outputs after compaction | `60000` |
+| `CODEX_POST_COMPACT_PRUNE_TRIGGER_TOKENS` | Estimated token threshold before emergency post-compaction history pruning activates (protects KV-cache) | `116000` |
 | `CODEX_POST_COMPACT_TOOL_OUTPUT_KEEP_RECENT` | Recent tool outputs kept in full after compaction | `2` |
 | `CODEX_FORWARD_TOOL_PROGRESS` | Forward concise assistant updates before tool calls | `1` |
 | `CODEX_PROGRESS_MAX_CHARS` | Maximum length of a forwarded tool-progress update | `1200` |
