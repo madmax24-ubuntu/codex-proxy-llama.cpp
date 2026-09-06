@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.56";
+const VERSION = "1.0.57";
 const SELFTEST_MODE = process.argv.includes("--selftest");
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
@@ -42,6 +42,8 @@ const DEBUG = /^(1|true|yes)$/i.test(process.env.CODEX_PROXY_DEBUG || "");
 const DIAG_PATH = process.env.CODEX_PROXY_DIAG || path.join(__dirname, "proxy.log");
 const POST_COMPACT_OLD_USER_TOKEN_LIMIT = Math.max(0, Number(process.env.CODEX_POST_COMPACT_OLD_USER_TOKEN_LIMIT || "0") || 0);
 const POST_COMPACT_TOOL_OUTPUT_MAX_CHARS = Math.max(1000, Number(process.env.CODEX_POST_COMPACT_TOOL_OUTPUT_MAX_CHARS || "4000") || 4000);
+const POST_COMPACT_SOURCE_OUTPUT_MAX_CHARS = Math.max(4000, Number(process.env.CODEX_POST_COMPACT_SOURCE_OUTPUT_MAX_CHARS || "12000") || 12000);
+const POST_COMPACT_SOURCE_TOTAL_CHARS = Math.max(16000, Number(process.env.CODEX_POST_COMPACT_SOURCE_TOTAL_CHARS || "60000") || 60000);
 const POST_COMPACT_TOOL_OUTPUT_KEEP_RECENT = Math.max(1, Math.min(8, Number(process.env.CODEX_POST_COMPACT_TOOL_OUTPUT_KEEP_RECENT || "2") || 2));
 const COMPACT_MAX_OUTPUT_TOKENS = Math.max(1024, Number(process.env.CODEX_COMPACT_MAX_OUTPUT_TOKENS || "4096") || 4096);
 const COMPACT_REASONING_EFFORT = String(process.env.CODEX_COMPACT_REASONING_EFFORT || "low").toLowerCase();
@@ -1419,10 +1421,19 @@ function prunePostCompactionToolOutputs(body, maxChars = POST_COMPACT_TOOL_OUTPU
     return { foundSummary: false, truncated: 0, beforeChars: 0, afterChars: 0 };
   }
   const outputs = [];
+  const sourceCall = index => {
+    const output = body.input[index];
+    const callId = output?.call_id || output?.item_id;
+    const call = body.input.slice(0, index).reverse().find(item =>
+      item && (item.type === "function_call" || item.type === "custom_tool_call") &&
+      (!callId || item.call_id === callId || item.id === callId));
+    const text = call ? JSON.stringify(call) : "";
+    return /get_code_snippet|search_graph|trace_path|query_graph|read_file|readfile|get-content|cat\s|sed\s|head\s|tail\s|\btype\s+[^-]/i.test(text);
+  };
   for (let index = 0; index < body.input.length; index++) {
     const item = body.input[index];
     if (!item || !["function_call_output", "custom_tool_call_output"].includes(item.type) || typeof item.output !== "string") continue;
-    outputs.push({ index, chars: item.output.length });
+    outputs.push({ index, chars: item.output.length, source: sourceCall(index) });
   }
   const protectedIndexes = new Set(outputs.slice(-keepRecent).map(item => item.index));
   const totalLimit = maxChars * 8;
@@ -1433,10 +1444,12 @@ function prunePostCompactionToolOutputs(body, maxChars = POST_COMPACT_TOOL_OUTPU
   for (const entry of outputs) {
     const item = body.input[entry.index];
     beforeChars += entry.chars;
-    if (!protectedIndexes.has(entry.index) && (entry.chars > maxChars || retained + entry.chars > totalLimit)) {
+    const entryLimit = entry.source ? POST_COMPACT_SOURCE_OUTPUT_MAX_CHARS : maxChars;
+    const entryTotal = entry.source ? POST_COMPACT_SOURCE_TOTAL_CHARS : totalLimit;
+    if (!protectedIndexes.has(entry.index) && (entry.chars > entryLimit || retained + entry.chars > entryTotal)) {
       const digest = crypto.createHash("sha256").update(item.output).digest("hex").slice(0, 16);
       const marker = `\n...[POST-COMPACTION TOOL OUTPUT TRUNCATED sha256=${digest} original_chars=${entry.chars}]...\n`;
-      const available = retained + entry.chars > totalLimit ? 0 : Math.max(0, maxChars - marker.length);
+      const available = retained + entry.chars > entryTotal ? 0 : Math.max(0, entryLimit - marker.length);
       const head = Math.floor(available * 0.75);
       const tail = available - head > 0 ? item.output.slice(-(available - head)) : "";
       item.output = item.output.slice(0, head) + marker + tail;
