@@ -2,7 +2,7 @@
 "use strict";
 
 /*
-  Codex <-> llama.cpp Responses compatibility proxy 1.0.3
+  Codex <-> llama.cpp Responses compatibility proxy v16.11
 
   Adds support for:
     - Codex namespace tools (MCP) -> flattened function tools for llama.cpp
@@ -11,15 +11,15 @@
     - replay/history conversion for namespaced + custom tool calls
     - normalization of Responses system/developer history into one leading instructions block
     - removal of hosted web_search (use MCP web search instead)
-    - configurable reasoning-effort passthrough and per-request thinking budgets
+    - switchable Qwen reasoning and generic non-thinking profiles
     - native Responses transport retained end-to-end (no Responses -> Chat conversion)
-    - guarded structured compaction with automatic truncated-summary repair
+    - fast structured compaction (3072 output cap, tools disabled)
     - preserves the current real user goal + canonical initial context after compaction
     - removes only older retained user messages, not the live task state
     - JSON cold checkpoints for exact pre-compaction recovery
     - transparent SSE bridge: every downstream JSON chunk is a complete SSE event
     - Codex-compatible response.completed usage normalization
-    - safe user-facing progress forwarding without exposing internal reasoning
+    - tool-step assistant chatter suppression and no ordinary shell-call interception
 
   No npm packages required.
 */
@@ -31,19 +31,21 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.59";
+const VERSION = "v16.39";
 const SELFTEST_MODE = process.argv.includes("--selftest");
+
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
-const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
-const UPSTREAM_API_KEY = process.env.LLAMA_API_KEY || "";
-const DEFAULT_MODEL = process.env.CODEX_MODEL || "llm";
+const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://100.89.167.43:8080");
 const DEBUG = /^(1|true|yes)$/i.test(process.env.CODEX_PROXY_DEBUG || "");
-const DIAG_PATH = process.env.CODEX_PROXY_DIAG || path.join(__dirname, "proxy.log");
+const DIAG_PATH = process.env.CODEX_PROXY_DIAG || path.join(__dirname, "proxy-v16.log");
+const THINKING_MODE = String(process.env.CODEX_THINKING_MODE || "qwen").toLowerCase();
+const MAX_OUTPUT_TOKENS = Math.max(0, Number(process.env.CODEX_MAX_OUTPUT_TOKENS || "0") || 0);
 const POST_COMPACT_OLD_USER_TOKEN_LIMIT = Math.max(0, Number(process.env.CODEX_POST_COMPACT_OLD_USER_TOKEN_LIMIT || "0") || 0);
-const POST_COMPACT_TOOL_OUTPUT_MAX_CHARS = Math.max(1000, Number(process.env.CODEX_POST_COMPACT_TOOL_OUTPUT_MAX_CHARS || "4000") || 4000);
-const POST_COMPACT_SOURCE_OUTPUT_MAX_CHARS = Math.max(4000, Number(process.env.CODEX_POST_COMPACT_SOURCE_OUTPUT_MAX_CHARS || "12000") || 12000);
-const POST_COMPACT_SOURCE_TOTAL_CHARS = Math.max(16000, Number(process.env.CODEX_POST_COMPACT_SOURCE_TOTAL_CHARS || "60000") || 60000);
+const POST_COMPACT_TOOL_OUTPUT_MAX_CHARS = Math.max(0, Number(process.env.CODEX_POST_COMPACT_TOOL_OUTPUT_MAX_CHARS ?? "4000") || 0);
+const POST_COMPACT_SOURCE_OUTPUT_MAX_CHARS = Math.max(0, Number(process.env.CODEX_POST_COMPACT_SOURCE_OUTPUT_MAX_CHARS ?? "12000") || 0);
+const POST_COMPACT_SOURCE_TOTAL_CHARS = Math.max(0, Number(process.env.CODEX_POST_COMPACT_SOURCE_TOTAL_CHARS ?? "60000") || 0);
+const POST_COMPACT_PRUNE_TRIGGER_TOKENS = Math.max(114000, Number(process.env.CODEX_POST_COMPACT_PRUNE_TRIGGER_TOKENS || "114000") || 114000);
 const POST_COMPACT_TOOL_OUTPUT_KEEP_RECENT = Math.max(1, Math.min(8, Number(process.env.CODEX_POST_COMPACT_TOOL_OUTPUT_KEEP_RECENT || "2") || 2));
 const COMPACT_MAX_OUTPUT_TOKENS = Math.max(1024, Number(process.env.CODEX_COMPACT_MAX_OUTPUT_TOKENS || "4096") || 4096);
 const COMPACT_REASONING_EFFORT = String(process.env.CODEX_COMPACT_REASONING_EFFORT || "low").toLowerCase();
@@ -51,16 +53,12 @@ const COMPACT_REASONING_BUDGET = Math.max(0, Number(process.env.CODEX_COMPACT_RE
 const COMPACT_TASK_ANCHOR_MAX_CHARS = Math.max(2000, Math.min(20000, Number(process.env.CODEX_COMPACT_TASK_ANCHOR_MAX_CHARS || "8000") || 8000));
 const FORWARD_TOOL_PROGRESS = !/^(0|false|no)$/i.test(process.env.CODEX_FORWARD_TOOL_PROGRESS || "1");
 const PROGRESS_MAX_CHARS = Math.max(120, Number(process.env.CODEX_PROGRESS_MAX_CHARS || "1200") || 1200);
-const REASONING_BUDGET_LOW = Math.max(0, Number(process.env.CODEX_REASONING_BUDGET_LOW || "0") || 0);
-const REASONING_BUDGET_MEDIUM = Math.max(0, Number(process.env.CODEX_REASONING_BUDGET_MEDIUM || "0") || 0);
-const REASONING_BUDGET_HIGH = Math.max(0, Number(process.env.CODEX_REASONING_BUDGET_HIGH || "0") || 0);
-const REASONING_BUDGET_XHIGH = Math.max(0, Number(process.env.CODEX_REASONING_BUDGET_XHIGH || "0") || 0);
-const DEFAULT_REASONING_EFFORT = String(process.env.CODEX_DEFAULT_REASONING_EFFORT || "high").toLowerCase();
-const REASONING_HIGH_MAP = String(process.env.CODEX_REASONING_HIGH_MAP || "high").toLowerCase();
-const SUPPORTED_REASONING_LEVELS = new Set(String(process.env.CODEX_REASONING_LEVELS || "low,medium,high")
-  .split(",").map(x => x.trim().toLowerCase()).filter(Boolean));
-const THINKING_MODE = String(process.env.CODEX_THINKING_MODE || "auto").toLowerCase();
+const REASONING_BUDGET_LOW = Math.max(0, Number(process.env.CODEX_REASONING_BUDGET_LOW || "1024") || 1024);
+const REASONING_BUDGET_MEDIUM = Math.max(0, Number(process.env.CODEX_REASONING_BUDGET_MEDIUM || "4096") || 4096);
+const REASONING_BUDGET_XHIGH = Math.max(0, Number(process.env.CODEX_REASONING_BUDGET_XHIGH || "6144") || 6144);
 const FORCE_SERIAL_TOOL_CALLS = !/^(0|false|no)$/i.test(process.env.CODEX_FORCE_SERIAL_TOOL_CALLS || "1");
+const CACHE_PROMPT = !/^(0|false|no)$/i.test(process.env.CODEX_CACHE_PROMPT || "1");
+const LLAMA_SLOT = Number.isInteger(Number(process.env.CODEX_LLAMA_SLOT)) ? Number(process.env.CODEX_LLAMA_SLOT) : 0;
 const UPSTREAM_RETRY_ATTEMPTS = Math.max(0, Math.min(60, Number(process.env.CODEX_UPSTREAM_RETRY_ATTEMPTS || "30") || 30));
 const UPSTREAM_RETRY_BASE_MS = Math.max(100, Number(process.env.CODEX_UPSTREAM_RETRY_BASE_MS || "1000") || 1000);
 const UPSTREAM_RETRY_MAX_MS = Math.max(UPSTREAM_RETRY_BASE_MS, Number(process.env.CODEX_UPSTREAM_RETRY_MAX_MS || "10000") || 10000);
@@ -82,7 +80,7 @@ let CACHED_MCP_NAMESPACES = [];
 
 function log(...a) { console.log("[codex-llama-proxy]", ...a); }
 function debug(...a) { if (DEBUG) console.log("[codex-llama-proxy:debug]", ...a); }
-function diag(line) { if (SELFTEST_MODE) return; try { fs.appendFileSync(DIAG_PATH, `[${new Date().toISOString()}] ${line}\n`); } catch { } }
+function diag(line) { if (SELFTEST_MODE) return; try { fs.appendFileSync(DIAG_PATH, `[${new Date().toISOString()}] ${line}\n`); } catch {} }
 function clone(x) { return JSON.parse(JSON.stringify(x)); }
 
 function safeMkdir(dir) {
@@ -321,13 +319,13 @@ function requestCacheKey(body) {
     body.metadata?.conversation_id
   ];
   for (const v of candidates) if (typeof v === "string" && v) return v;
-  return `model:${body.model || DEFAULT_MODEL}`;
+  return `model:${body.model || "llm"}`;
 }
 
 function requestFingerprint(body) {
   try {
     const raw = JSON.stringify({
-      model: body?.model || DEFAULT_MODEL,
+      model: body?.model || "llm",
       instructions: body?.instructions || "",
       input: body?.input || null
     });
@@ -373,7 +371,7 @@ function restoreCheckpointIndex(limit = 256) {
       try { obj = JSON.parse(fs.readFileSync(file, "utf8")); } catch { continue; }
       const body = obj?.payload?.request;
       if (!body || typeof obj.compact_summary !== "string" || !obj.compact_summary) continue;
-      const keys = [requestCacheKey(body), `model:${body.model || DEFAULT_MODEL}`];
+      const keys = [requestCacheKey(body), `model:${body.model || "llm"}`];
       for (const key of keys) if (!CHECKPOINT_BY_KEY.has(key)) CHECKPOINT_BY_KEY.set(key, file);
       const hash = checkpointSummaryHash(obj.compact_summary);
       if (hash && !CHECKPOINT_BY_SUMMARY.has(hash)) CHECKPOINT_BY_SUMMARY.set(hash, file);
@@ -436,28 +434,40 @@ function pruneCompactionInputHistory(body, maxCharsPerToolOutput = 3000) {
 
 function applyCompactionPolicy(body, limit = COMPACT_MAX_OUTPUT_TOKENS, continuity = buildCompactionContinuity(body)) {
   if (!body || typeof body !== "object") return body;
+  // Compaction is a summarization side-query, not an agentic reasoning turn.
+  // Qwen3.8-27B officially supports disabling thinking per request. Keeping
+  // thinking enabled here wastes output budget and can make llama.cpp return
+  // an incomplete response, which Codex retries from scratch.
   body.max_output_tokens = Math.max(1024, Number(limit) || COMPACT_MAX_OUTPUT_TOKENS);
-  body.reasoning = body.reasoning && typeof body.reasoning === "object" ? body.reasoning : {};
-  body.reasoning.effort = COMPACT_REASONING_EFFORT;
-  if (COMPACT_REASONING_BUDGET > 0) body.thinking_budget_tokens = COMPACT_REASONING_BUDGET;
-  else delete body.thinking_budget_tokens;
-  if (usesTemplateThinking(body)) {
+  if (usesTemplateThinking()) {
+    body.reasoning = body.reasoning && typeof body.reasoning === "object" ? body.reasoning : {};
+    body.reasoning.effort = COMPACT_REASONING_EFFORT;
+    body.thinking_budget_tokens = COMPACT_REASONING_BUDGET;
     body.chat_template_kwargs = body.chat_template_kwargs && typeof body.chat_template_kwargs === "object"
       ? body.chat_template_kwargs
       : {};
     body.chat_template_kwargs.enable_thinking = false;
     body.chat_template_kwargs.preserve_thinking = false;
+  } else {
+    delete body.reasoning;
+    delete body.thinking_budget_tokens;
+    if (body.chat_template_kwargs && typeof body.chat_template_kwargs === "object") {
+      delete body.chat_template_kwargs.enable_thinking;
+      delete body.chat_template_kwargs.preserve_thinking;
+      if (!Object.keys(body.chat_template_kwargs).length) delete body.chat_template_kwargs;
+    }
   }
   body.tool_choice = "none";
   body.parallel_tool_calls = false;
   pruneCompactionInputHistory(body);
   const anchor = compactionContinuityPrompt(continuity);
-  const contract = `COMPACTION OUTPUT CONTRACT: Return only a dense checkpoint in the configured user language. The first line must be # CONTEXT CHECKPOINT SUMMARY. Use Markdown headings in this exact order: CURRENT TASK, WORK COMPLETED, DECISIONS AND CONSTRAINTS, STATE SNAPSHOT, OPEN ISSUES, PARKED TASKS, NEXT ACTION. Every heading is mandatory; write '- None.' when empty. CRITICAL REQUIREMENT: Review the entire preceding history carefully. List ALL steps that were already implemented, edited, or tested under WORK COMPLETED. NEVER list completed tasks or already applied patches in OPEN ISSUES or NEXT ACTION. Under CURRENT TASK, preserve the authoritative continuity anchor below instead of reviving an older task. Under NEXT ACTION, resume the active plan below when it exists. Target 1200-1800 tokens, start NEXT ACTION before token 2000, and finish it with a complete sentence.${anchor ? `\n\n${anchor}` : ""}`;
+  const contract = `COMPACTION OUTPUT CONTRACT: Return only a dense Russian checkpoint. The first line must be # CONTEXT CHECKPOINT SUMMARY. Use Markdown headings in this exact order: CURRENT TASK, WORK COMPLETED, DECISIONS AND CONSTRAINTS, STATE SNAPSHOT, OPEN ISSUES, PARKED TASKS, NEXT ACTION. Every heading is mandatory; write '- Нет.' when empty. CRITICAL REQUIREMENT: Review the entire preceding history carefully. List ALL steps that were already implemented, edited, or tested under WORK COMPLETED. NEVER list completed tasks or already applied patches in OPEN ISSUES or NEXT ACTION. Under CURRENT TASK, preserve the authoritative continuity anchor below instead of reviving an older task. Under NEXT ACTION, resume the active plan below when it exists. Target 1200-1800 tokens, start NEXT ACTION before token 2000, and finish it with a complete sentence.${anchor ? `\n\n${anchor}` : ""}`;
   const instructions = typeof body.instructions === "string" ? body.instructions.trim() : "";
   if (!instructions.includes("COMPACTION OUTPUT CONTRACT:")) {
     body.instructions = instructions ? `${instructions}\n\n${contract}` : contract;
   }
 
+  // Also replace/augment the trailing user compaction prompt with the strict instruction
   if (Array.isArray(body.input) && body.input.length) {
     const lastItem = body.input[body.input.length - 1];
     if (isUserMessageItem(lastItem)) {
@@ -793,7 +803,7 @@ function decodeCustomArgs(name, args) {
     if (parsed && typeof parsed[key] === "string") decoded = parsed[key];
     else if (parsed && typeof parsed.input === "string") decoded = parsed.input;
     else if (parsed && typeof parsed.patch === "string") decoded = parsed.patch;
-  } catch { }
+  } catch {}
   const normalized = name === "apply_patch" ? normalizeApplyPatchInput(decoded) : decoded;
   if (normalized !== decoded) diag("EDIT normalized apply_patch protocol headers");
   return normalized;
@@ -806,7 +816,7 @@ function shellCommandText(args) {
     if (typeof parsed?.command === "string") return parsed.command;
     if (Array.isArray(parsed?.command)) return parsed.command.join(" ");
     if (typeof parsed?.cmd === "string") return parsed.cmd;
-  } catch { }
+  } catch {}
   return args;
 }
 
@@ -850,7 +860,6 @@ function canonicalToolOutcome(item) {
     .replace(/\bChunk ID:\s*\S+/gi, "Chunk ID: <volatile>")
     .replace(/\bWall time:\s*[\d.]+\s*seconds?/gi, "Wall time: <volatile>")
     .replace(/\bcall_[A-Za-z0-9_-]+\b/g, "call_<volatile>")
-    .replace(/\[AUTONOMOUS EXECUTION DIRECTIVE:[\s\S]*?\]\s*$/i, "")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -982,7 +991,7 @@ function messageContentText(content) {
       }
       // System/developer messages should be textual. If an unfamiliar block
       // appears, preserve it rather than silently discarding instructions.
-      try { parts.push(JSON.stringify(block)); } catch { }
+      try { parts.push(JSON.stringify(block)); } catch {}
     }
     return parts.filter(Boolean).join("\n");
   }
@@ -1124,7 +1133,7 @@ function buildCompactionContinuity(body) {
       const args = typeof item.arguments === "string" ? JSON.parse(item.arguments) : item.arguments;
       const steps = Array.isArray(args?.plan) ? args.plan.filter(step => step && typeof step.step === "string") : [];
       if (steps.length) plans.push({ index, steps });
-    } catch { }
+    } catch {}
   }
   const latest = users.length ? users[users.length - 1] : null;
   const previousTask = previousCheckpointTask(body);
@@ -1253,7 +1262,7 @@ function repairCompactionText(text, recovery = "", outputLimitHit = false) {
   const fallback = {
     "CURRENT TASK": "- Продолжить последний активный запрос пользователя.",
     "WORK COMPLETED": "- Сверить уже выполненную работу с рабочей директорией и cold memory.",
-    "DECISIONS AND CONSTRAINTS": "- Сохранить пользовательские изменения, язык общения и действующие ограничения.",
+    "DECISIONS AND CONSTRAINTS": "- Сохранить пользовательские изменения, русский язык и действующие ограничения.",
     "STATE SNAPSHOT": "- Полный transcript до сжатия сохранён в cold memory.",
     "OPEN ISSUES": "- Определить оставшиеся пункты по рабочему состоянию и cold memory.",
     "PARKED TASKS": "- Нет подтверждённых отложенных задач.",
@@ -1416,10 +1425,52 @@ function prunePostCompactionUserHistory(body, oldUserTokenLimit = POST_COMPACT_O
   };
 }
 
+function prunePreCompactionHistory(body) {
+  if (!body || typeof body !== "object" || !Array.isArray(body.input)) {
+    return { foundSummary: false, removed: 0 };
+  }
+  let summaryIndex = -1;
+  for (let i = body.input.length - 1; i >= 0; i--) {
+    if (isCompactionSummaryItem(body.input[i])) {
+      summaryIndex = i;
+      break;
+    }
+  }
+  if (summaryIndex <= 0) return { foundSummary: summaryIndex === 0, removed: 0 };
+  const preservedInstructions = [];
+  for (const item of body.input.slice(0, summaryIndex)) {
+    const role = String(item?.role || "").toLowerCase();
+    if ((role === "system" || role === "developer") && messageContentText(item.content)) {
+      preservedInstructions.push(messageContentText(item.content));
+    }
+  }
+  if (preservedInstructions.length) {
+    const current = String(body.instructions || "").trim();
+    const additions = preservedInstructions.filter(text => !current.includes(text));
+    if (additions.length) body.instructions = [current, ...additions].filter(Boolean).join("\n\n");
+  }
+  const removed = summaryIndex;
+  body.input = body.input.slice(summaryIndex);
+  return { foundSummary: true, removed };
+}
+
 function prunePostCompactionToolOutputs(body, maxChars = POST_COMPACT_TOOL_OUTPUT_MAX_CHARS, keepRecent = POST_COMPACT_TOOL_OUTPUT_KEEP_RECENT) {
   if (!body || typeof body !== "object" || !Array.isArray(body.input) || !body.input.some(isCompactionSummaryItem)) {
     return { foundSummary: false, truncated: 0, beforeChars: 0, afterChars: 0 };
   }
+  const estimatedChars = String(body.instructions || "").length + body.input.reduce((sum, item) => {
+    if (!item || typeof item !== "object") return sum;
+    const value = item.content ?? item.output ?? item.arguments ?? "";
+    return sum + String(typeof value === "string" ? value : JSON.stringify(value)).length;
+  }, 0);
+  const estimatedTokens = Math.ceil(estimatedChars / 4.0);
+  const pruneTrigger = SELFTEST_MODE ? 1000 : POST_COMPACT_PRUNE_TRIGGER_TOKENS;
+  if (estimatedTokens < pruneTrigger) {
+    return { foundSummary: true, truncated: 0, beforeChars: 0, afterChars: 0, estimatedTokens, deferred: true };
+  }
+  const effectiveMaxChars = maxChars || 4000;
+  const effectiveSourceMaxChars = POST_COMPACT_SOURCE_OUTPUT_MAX_CHARS || 12000;
+  const effectiveSourceTotalChars = POST_COMPACT_SOURCE_TOTAL_CHARS || 60000;
   const outputs = [];
   const sourceCall = index => {
     const output = body.input[index];
@@ -1438,7 +1489,7 @@ function prunePostCompactionToolOutputs(body, maxChars = POST_COMPACT_TOOL_OUTPU
     outputs.push({ index, chars: item.output.length, source: sourceCall(index) });
   }
   const protectedIndexes = new Set(outputs.slice(-keepRecent).map(item => item.index));
-  const totalLimit = maxChars * 8;
+  const totalLimit = effectiveMaxChars * 8;
   const retained = { source: 0, ordinary: 0 };
   let truncated = 0;
   const beforeChars = outputs.reduce((sum, entry) => sum + entry.chars, 0);
@@ -1450,8 +1501,8 @@ function prunePostCompactionToolOutputs(body, maxChars = POST_COMPACT_TOOL_OUTPU
       continue;
     }
     const bucket = entry.source ? "source" : "ordinary";
-    const entryLimit = entry.source ? POST_COMPACT_SOURCE_OUTPUT_MAX_CHARS : maxChars;
-    const entryTotal = entry.source ? POST_COMPACT_SOURCE_TOTAL_CHARS : totalLimit;
+    const entryLimit = entry.source ? effectiveSourceMaxChars : effectiveMaxChars;
+    const entryTotal = entry.source ? effectiveSourceTotalChars : totalLimit;
     const remaining = Math.max(0, entryTotal - retained[bucket]);
     if (entry.chars > entryLimit || entry.chars > remaining) {
       const digest = crypto.createHash("sha256").update(item.output).digest("hex").slice(0, 16);
@@ -1465,7 +1516,7 @@ function prunePostCompactionToolOutputs(body, maxChars = POST_COMPACT_TOOL_OUTPU
     retained[bucket] += item.output.length;
     afterChars += item.output.length;
   }
-  return { foundSummary: true, truncated, beforeChars, afterChars, retainedSourceChars: retained.source, retainedToolChars: retained.ordinary };
+  return { foundSummary: true, truncated, beforeChars, afterChars, estimatedTokens, retainedSourceChars: retained.source, retainedToolChars: retained.ordinary };
 }
 
 function appendPostCompactContinuationRule(body) {
@@ -1609,9 +1660,9 @@ function rewriteHistoryNode(node, maps, repairs = []) {
 
   // Codex namespaced function call -> flat llama.cpp function call.
   if (node.type === "function_call" &&
-    typeof node.name === "string" &&
-    typeof node.namespace === "string" &&
-    node.namespace) {
+      typeof node.name === "string" &&
+      typeof node.namespace === "string" &&
+      node.namespace) {
     node.name = flatNs(node.namespace, node.name);
     delete node.namespace;
   }
@@ -1648,37 +1699,58 @@ function rewriteHistoryNode(node, maps, repairs = []) {
   return repairs;
 }
 
+const QWEN38_REASONING_LEVELS = new Set(["low", "medium", "xhigh"]);
+
+function usesTemplateThinking() {
+  return THINKING_MODE !== "generic" && THINKING_MODE !== "off";
+}
+
 function reasoningBudgetForEffort(effort) {
   if (effort === "low") return REASONING_BUDGET_LOW;
   if (effort === "medium") return REASONING_BUDGET_MEDIUM;
-  if (effort === "high") return REASONING_BUDGET_HIGH;
   if (effort === "xhigh") return REASONING_BUDGET_XHIGH;
   return null;
 }
 
-function usesTemplateThinking(body) {
-  if (THINKING_MODE === "on" || THINKING_MODE === "qwen") return true;
-  if (THINKING_MODE === "off" || THINKING_MODE === "generic") return false;
-  return String(body?.model || DEFAULT_MODEL).toLowerCase().includes("qwen");
-}
-
 function normalizeReasoningEffort(body) {
+  if (!usesTemplateThinking()) {
+    delete body.reasoning;
+    delete body.thinking_budget_tokens;
+    diag("REASONING disabled profile=generic");
+    return { raw: null, effective: "none", mapped: false, budget: 0 };
+  }
   const reasoning = body && typeof body === "object" ? body.reasoning : null;
-  const raw = typeof reasoning?.effort === "string" ? reasoning.effort.toLowerCase() : null;
-  let effective = raw || DEFAULT_REASONING_EFFORT;
+  if (!reasoning || typeof reasoning !== "object") {
+    // Qwen3.8 defaults to xhigh when Codex omits effort. Cap that default too so
+    // a single agent step cannot disappear into an unbounded reasoning run.
+    body.thinking_budget_tokens = REASONING_BUDGET_XHIGH;
+    diag(`REASONING request effort=missing default=xhigh budget=${REASONING_BUDGET_XHIGH}`);
+    return { raw: null, effective: "xhigh", mapped: false, budget: REASONING_BUDGET_XHIGH };
+  }
+
+  const raw = typeof reasoning.effort === "string" ? reasoning.effort.toLowerCase() : null;
+  if (!raw) {
+    body.thinking_budget_tokens = REASONING_BUDGET_XHIGH;
+    diag(`REASONING request effort=missing default=xhigh budget=${REASONING_BUDGET_XHIGH}`);
+    return { raw: null, effective: "xhigh", mapped: false, budget: REASONING_BUDGET_XHIGH };
+  }
+
+  // Qwen3.8 officially exposes low / medium / xhigh. Older Codex catalogs or
+  // stale UI state may still send "high"; map it to xhigh.
+  let effective = raw;
   let mapped = false;
-  if (raw === "high" && REASONING_HIGH_MAP !== "high") {
-    effective = REASONING_HIGH_MAP;
+  if (raw === "high") {
+    effective = "xhigh";
     reasoning.effort = effective;
     mapped = true;
   }
 
   const budget = reasoningBudgetForEffort(effective);
-  if (!SUPPORTED_REASONING_LEVELS.has(effective)) {
-    diag(`REASONING WARNING unsupported effort=${effective}; forwarding unchanged`);
-  } else if (budget > 0) {
+  if (!QWEN38_REASONING_LEVELS.has(effective) || budget == null) {
+    diag(`REASONING WARNING unsupported effort=${raw}; forwarding effort unchanged without forced budget`);
+  } else {
     body.thinking_budget_tokens = budget;
-    diag(`REASONING request raw=${raw || "missing"} effective=${effective}${mapped ? " mapped=1" : ""} budget=${budget}`);
+    diag(`REASONING request raw=${raw} effective=${effective}${mapped ? " mapped=1" : ""} budget=${budget}`);
   }
 
   return { raw, effective, mapped, budget };
@@ -1689,12 +1761,19 @@ function prepareRequest(original) {
   const maps = toolMaps();
   const repeatGuard = repeatedToolCallRecovery(body);
 
-  if (usesTemplateThinking(body)) {
+  // Qwen3.8's official template is a thinking template. Preserve reasoning
+  // across tool turns and keep function calling serial for llama.cpp/Qwen
+  // parser reliability. Existing explicit kwargs are respected.
+  if (usesTemplateThinking()) {
     body.chat_template_kwargs = body.chat_template_kwargs && typeof body.chat_template_kwargs === "object"
       ? body.chat_template_kwargs
       : {};
     if (body.chat_template_kwargs.enable_thinking === undefined) body.chat_template_kwargs.enable_thinking = true;
     if (body.chat_template_kwargs.preserve_thinking === undefined) body.chat_template_kwargs.preserve_thinking = true;
+  } else if (body.chat_template_kwargs && typeof body.chat_template_kwargs === "object") {
+    delete body.chat_template_kwargs.enable_thinking;
+    delete body.chat_template_kwargs.preserve_thinking;
+    if (!Object.keys(body.chat_template_kwargs).length) delete body.chat_template_kwargs;
   }
   if (FORCE_SERIAL_TOOL_CALLS) body.parallel_tool_calls = false;
 
@@ -1711,67 +1790,23 @@ function prepareRequest(original) {
   } else if (!body.instructions) {
     body.instructions = autonomyRule;
   }
+  const preCompactionHistory = prunePreCompactionHistory(body);
+  if (preCompactionHistory.removed) diag(`POST_COMPACT history_pruned removed_items=${preCompactionHistory.removed}`);
   const postCompactPruning = prunePostCompactionUserHistory(body);
   const postCompactToolPruning = prunePostCompactionToolOutputs(body);
   pruneOrphanProgressMessages(body);
   rewriteTools(body, maps);
   appendCapabilityGuidance(body);
-  if (Array.isArray(body.input) && body.input.length > 0) {
-    const last = body.input[body.input.length - 1];
-    const lastRole = last && (last.role || (Array.isArray(last) ? last[0]?.role : null));
-    const isUserOrTool = lastRole === "tool" || lastRole === "function" ||
-      (last && (last.type === "function_call_output" || last.type === "custom_tool_call_output"));
-    
-    const isTerminalWithoutTool = lastRole === "assistant" || (last && last.type === "message" && (last.role === "assistant" || !last.role));
-
-    const autonomyDirective = "[AUTONOMOUS EXECUTION DIRECTIVE: Continue working autonomously. Do NOT stop with an empty message or progress summary. Immediately execute the next required tool call to complete, verify, and push all tasks.]";
-
-    if (isUserOrTool) {
-      if (typeof last.output === "string") {
-        last.output = `${last.output.trim()}\n\n${autonomyDirective}`;
-      } else if (Array.isArray(last.output) && last.output.length > 0) {
-        const lastBlock = last.output[last.output.length - 1];
-        if (lastBlock && typeof lastBlock === "object") {
-          if (typeof lastBlock.text === "string") {
-            lastBlock.text = `${lastBlock.text.trim()}\n\n${autonomyDirective}`;
-          } else if (typeof lastBlock.content === "string") {
-            lastBlock.content = `${lastBlock.content.trim()}\n\n${autonomyDirective}`;
-          } else {
-            last.output.push({ type: "input_text", text: autonomyDirective });
-          }
-        } else if (typeof lastBlock === "string") {
-          last.output[last.output.length - 1] = `${lastBlock.trim()}\n\n${autonomyDirective}`;
-        } else {
-          last.output.push({ type: "input_text", text: autonomyDirective });
-        }
-      } else if (!last.output) {
-        last.output = autonomyDirective;
-      }
-    } else {
-      if (typeof last.content === "string") {
-        last.content = `${last.content.trim()}\n\n${autonomyDirective}`;
-      } else if (Array.isArray(last.content) && last.content.length > 0) {
-        const lastPart = last.content[last.content.length - 1];
-        if (lastPart && typeof lastPart === "object") {
-          if (typeof lastPart.text === "string") {
-            lastPart.text = `${lastPart.text.trim()}\n\n${autonomyDirective}`;
-          } else if (typeof lastPart.content === "string") {
-            lastPart.content = `${lastPart.content.trim()}\n\n${autonomyDirective}`;
-          } else {
-            last.content.push({ type: "input_text", text: autonomyDirective });
-          }
-        } else if (typeof lastPart === "string") {
-          last.content[last.content.length - 1] = `${lastPart.trim()}\n\n${autonomyDirective}`;
-        } else {
-          last.content.push({ type: "input_text", text: autonomyDirective });
-        }
-      } else if (typeof last.text === "string") {
-        last.text = `${last.text.trim()}\n\n${autonomyDirective}`;
-      }
-    }
-  }
+  // Autonomy protocol is maintained cleanly in instructions without polluting input history turns.
 
   const historyRepairs = rewriteHistoryNode(body.input, maps);
+
+  if (MAX_OUTPUT_TOKENS > 0) {
+    const requested = Number(body.max_output_tokens);
+    body.max_output_tokens = Number.isFinite(requested) && requested > 0
+      ? Math.min(requested, MAX_OUTPUT_TOKENS)
+      : MAX_OUTPUT_TOKENS;
+  }
 
   if (Array.isArray(body.include)) {
     body.include = body.include.filter(x =>
@@ -1779,7 +1814,7 @@ function prepareRequest(original) {
     );
   }
 
-  return { body, maps, instructionNormalization, reasoningNormalization, postCompactPruning, postCompactToolPruning, historyRepairs, repeatGuard };
+  return { body, maps, instructionNormalization, reasoningNormalization, preCompactionHistory, postCompactPruning, postCompactToolPruning, historyRepairs, repeatGuard };
 }
 
 function namespaceInfo(name, maps) {
@@ -1809,7 +1844,7 @@ function convertFunctionItem(item, maps) {
 
 
   if ((item.name === "shell_command" || item.name === "exec_command") &&
-    looksLikeDirectFileWrite(shellCommandText(item.arguments))) {
+      looksLikeDirectFileWrite(shellCommandText(item.arguments))) {
     diag(`EDIT WARNING direct file write requested through ${item.name}; prefer native apply_patch for localized source/config edits`);
   }
 
@@ -2011,10 +2046,10 @@ function memoryRequestMeta(body) {
   return { task: task.text, taskKey, project, evidence, files: [...files].slice(0, 20), hasCommit, hasTest };
 }
 
-function memoryInstructionForRequest(body) {
+function memoryInstructionForRequest(body, forceAfterCompaction = false) {
   const meta = memoryRequestMeta(body);
   if (!MEMORY_ENABLED || isCompactionRequest(body) || !meta.task ||
-      memoryHasRegressionSignal(meta.task) || MEMORY_INJECTED_TASKS.has(meta.taskKey)) {
+      memoryHasRegressionSignal(meta.task) || (!forceAfterCompaction && MEMORY_INJECTED_TASKS.has(meta.taskKey))) {
     return { block: "", meta, count: 0 };
   }
   const store = getMemoryStore();
@@ -2413,9 +2448,9 @@ class SseTranslator {
     // decode the wrapper back to freeform text. Normal messages, reasoning,
     // namespace calls and shell calls remain streaming and untouched.
     if (evt.type === "response.output_item.added" &&
-      evt.item?.type === "function_call" &&
-      typeof evt.item.name === "string" &&
-      this.maps.customByName.has(evt.item.name)) {
+        evt.item?.type === "function_call" &&
+        typeof evt.item.name === "string" &&
+        this.maps.customByName.has(evt.item.name)) {
       const id = evt.item.id || evt.item.call_id;
       this.customItems.set(id, {
         name: evt.item.name,
@@ -2544,7 +2579,7 @@ class SseTranslator {
     } else if (evt.type === "response.failed" || evt.type === "error" || evt.type === "response.incomplete") {
       const kind = this.requestMeta.isCompaction ? "COMPACTION failed" : "response failed";
       let detail = "";
-      try { detail = JSON.stringify(evt.error ?? evt).slice(0, 4000); } catch { }
+      try { detail = JSON.stringify(evt.error ?? evt).slice(0, 4000); } catch {}
       diag(`${kind}; ${detail}`);
     }
 
@@ -2598,18 +2633,24 @@ function createServer() {
             requestMeta.recoverySummary = buildCompactionRecoverySummary(parsed);
             if (requestMeta.checkpointPath) {
               CHECKPOINT_BY_KEY.set(requestMeta.cacheKey, requestMeta.checkpointPath);
-              CHECKPOINT_BY_KEY.set(`model:${parsed.model || DEFAULT_MODEL}`, requestMeta.checkpointPath);
+              CHECKPOINT_BY_KEY.set(`model:${parsed.model || "llm"}`, requestMeta.checkpointPath);
             }
           }
 
-          const memory = memoryInstructionForRequest(parsed);
+          const hasCheckpointSummary = Array.isArray(parsed.input) && parsed.input.some(isCompactionSummaryItem);
+          const memory = memoryInstructionForRequest(parsed, hasCheckpointSummary);
           requestMeta.memoryTask = memory.meta;
           const prepared = prepareRequest(parsed);
           requestMeta.prepared = prepared;
           requestMeta.allowAutoContinue = isResponses && !requestMeta.isCompaction;
-          if (memory.block) {
+          if (memory.block && !String(prepared.body.instructions || "").includes(memory.block)) {
             prepared.body.instructions = `${String(prepared.body.instructions || "").trim()}\n\n${memory.block}`.trim();
             diag(`MEMORY injected count=${memory.count} chars=${memory.block.length} project=${JSON.stringify(memory.meta.project)}`);
+          }
+          const priorityMarker = "POST-COMPACTION PRIORITY ORDER:";
+          if (!String(prepared.body.instructions || "").includes(priorityMarker)) {
+            prepared.body.instructions = `${priorityMarker}\n1. Follow the current developer/system instructions.\n2. Re-read the checkpoint summary and preserve its WORK COMPLETED, STATE SNAPSHOT, OPEN ISSUES, and NEXT ACTION.\n3. Use injected EPISODIC KNOWLEDGE when relevant before rediscovering files or repeating completed work.\n4. Treat the latest explicit user message as the only higher-priority update.\n\n${String(prepared.body.instructions || "").trim()}`.trim();
+            diag("INSTRUCTIONS priority_order=1");
           }
           maps = prepared.maps;
 
@@ -2645,7 +2686,7 @@ function createServer() {
               `kept_old=${p.keptOld} removed_old=${p.removed}`
             );
             const t = prepared.postCompactToolPruning;
-            diag(`POST_COMPACT tool_outputs truncated=${t.truncated} before_chars=${t.beforeChars} after_chars=${t.afterChars} keep_recent=${POST_COMPACT_TOOL_OUTPUT_KEEP_RECENT} max_chars=${POST_COMPACT_TOOL_OUTPUT_MAX_CHARS}`);
+            diag(`POST_COMPACT tool_outputs truncated=${t.truncated} before_chars=${t.beforeChars} after_chars=${t.afterChars} estimated_tokens=${t.estimatedTokens || 0} deferred=${t.deferred ? 1 : 0} keep_recent=${POST_COMPACT_TOOL_OUTPUT_KEEP_RECENT} max_chars=${POST_COMPACT_TOOL_OUTPUT_MAX_CHARS}`);
           }
 
           const beforeTypes = Array.isArray(parsed.input)
@@ -2657,6 +2698,8 @@ function createServer() {
             : [typeof prepared.body.input];
 
           const kind = requestMeta.isCompaction ? "COMPACTION" : "response";
+          if (CACHE_PROMPT) prepared.body.cache_prompt = true;
+          if (LLAMA_SLOT >= 0) prepared.body.id_slot = LLAMA_SLOT;
           diag(`${kind} request bytes=${decoded.length} input before=[${beforeTypes.join(",")}] after=[${afterTypes.join(",")}]`);
 
           outbound = Buffer.from(JSON.stringify(prepared.body));
@@ -2671,7 +2714,6 @@ function createServer() {
 
         const transport = UPSTREAM.protocol === "https:" ? https : http;
         const headers = copyHeaders(req.headers);
-        if (UPSTREAM_API_KEY) headers.authorization = `Bearer ${UPSTREAM_API_KEY}`;
         headers["content-length"] = String(outbound.length);
         headers["accept-encoding"] = "identity";
         headers["connection"] = "close";
@@ -2772,7 +2814,7 @@ function createServer() {
                              (evt.item?.type === "function_call" || evt.item?.type === "custom_tool_call")) {
                     commit = true;
                   }
-                } catch { }
+                } catch {}
               }
               if (!commit) return;
               responseCommitted = true;
@@ -2810,7 +2852,7 @@ function createServer() {
                   const payload = line.slice(5).trimStart();
                   if (payload === "[DONE]") sawDoneMarker = true;
                   else {
-                    try { if (JSON.parse(payload)?.type === "response.completed") sawResponseCompleted = true; } catch { }
+                    try { if (JSON.parse(payload)?.type === "response.completed") sawResponseCompleted = true; } catch {}
                   }
                 }
                 writeTranslated(tr.translate(line));
@@ -2824,7 +2866,7 @@ function createServer() {
                   const payload = pending.slice(5).trimStart();
                   if (payload === "[DONE]") sawDoneMarker = true;
                   else {
-                    try { if (JSON.parse(payload)?.type === "response.completed") sawResponseCompleted = true; } catch { }
+                    try { if (JSON.parse(payload)?.type === "response.completed") sawResponseCompleted = true; } catch {}
                   }
                 }
                 writeTranslated(tr.translate(pending));
@@ -3047,7 +3089,7 @@ function createServer() {
                   }
                 }
                 output = Buffer.from(JSON.stringify(obj));
-              } catch { }
+              } catch {}
             } else if ((ures.statusCode || 200) >= 400 && raw.length) {
               const kind = requestMeta.isCompaction ? "COMPACTION upstream error" : "upstream error";
               diag(`${kind} status=${ures.statusCode || 0} body=${raw.toString("utf8").slice(0, 4000)}`);
@@ -3154,7 +3196,7 @@ function selftest() {
   const malformedPatch = "*** begin patch\n*** Update file: fixture.txt\n@@\n-old\n+new\n*** end patch";
   const normalizedPatch = decodeCustomArgs("apply_patch", JSON.stringify({ patch: malformedPatch }));
   if (!normalizedPatch.startsWith("*** Begin Patch\n*** Update File: fixture.txt") ||
-    !normalizedPatch.endsWith("*** End Patch")) {
+      !normalizedPatch.endsWith("*** End Patch")) {
     throw new Error("apply_patch protocol header normalization failed");
   }
   if (!p.body.tools.find(x => x.name === "mcp__demo__ping")) {
@@ -3197,11 +3239,11 @@ function selftest() {
   rewriteResponseObject(response, p.maps);
 
   if (response.output[0].type !== "custom_tool_call" ||
-    response.output[0].input.indexOf("*** Begin Patch") === -1) {
+      response.output[0].input.indexOf("*** Begin Patch") === -1) {
     throw new Error("function->custom apply_patch response conversion failed");
   }
   if (response.output[1].namespace !== "mcp__demo" ||
-    response.output[1].name !== "ping") {
+      response.output[1].name !== "ping") {
     throw new Error("namespace response unflatten failed");
   }
 
@@ -3228,7 +3270,7 @@ function selftest() {
   };
   rewriteResponseObject(largeResponse, p.maps);
   if (largeResponse.output[0].type !== "custom_tool_call" ||
-    largeResponse.output[0].input !== largePatch) {
+      largeResponse.output[0].input !== largePatch) {
     throw new Error("3000-line apply_patch round-trip failed");
   }
 
@@ -3252,7 +3294,7 @@ function selftest() {
   }));
   const doneText = doneLines.join("");
   if (!doneText.includes('"type":"response.custom_tool_call_input.done"') ||
-    !doneText.includes("line-1500-edited")) {
+      !doneText.includes("line-1500-edited")) {
     throw new Error("streamed 3000-line apply_patch translation failed");
   }
 
@@ -3279,8 +3321,8 @@ function selftest() {
   }
 
   if (!looksLikeDirectFileWrite('Set-Content -Path "x.js" -Value $code') ||
-    !looksLikeDirectFileWrite('[System.IO.File]::WriteAllText("x.js", $code)') ||
-    looksLikeDirectFileWrite('Get-Content x.js | Select-Object -First 20')) {
+      !looksLikeDirectFileWrite('[System.IO.File]::WriteAllText("x.js", $code)') ||
+      looksLikeDirectFileWrite('Get-Content x.js | Select-Object -First 20')) {
     throw new Error("direct file-write detection failed");
   }
   if (!hasExplicitRemainingWork("Баг найден и исправлен.\n\nОсталось по parked-списку: compliance-аудит и прогон тестов.") ||
@@ -3305,10 +3347,10 @@ function selftest() {
   // into one invalid JSON event. Every synthetic event must now parse alone.
   const customFramed = parseSseJsonEvents(doneLines);
   if (customFramed.length !== 4 ||
-    customFramed[0]?.type !== "response.output_item.added" ||
-    customFramed[1]?.type !== "response.custom_tool_call_input.delta" ||
-    customFramed[2]?.type !== "response.custom_tool_call_input.done" ||
-    customFramed[3]?.type !== "response.output_item.done") {
+      customFramed[0]?.type !== "response.output_item.added" ||
+      customFramed[1]?.type !== "response.custom_tool_call_input.delta" ||
+      customFramed[2]?.type !== "response.custom_tool_call_input.done" ||
+      customFramed[3]?.type !== "response.output_item.done") {
     throw new Error(`custom tool SSE framing failed: ${JSON.stringify(customFramed.map(x => x?.type || x))}`);
   }
 
@@ -3346,8 +3388,8 @@ function selftest() {
     item: { id: "fc_shell_stream", type: "function_call", call_id: "call_shell_stream", name: "shell_command", arguments: JSON.stringify({ command: shellPatchCommand }) }
   }));
   if (shellAdded.length !== 1 || shellArgs.length !== 1 || shellDone.length !== 1 ||
-    !shellAdded[0].includes('"name":"shell_command"') ||
-    !shellDone[0].includes('"name":"shell_command"')) {
+      !shellAdded[0].includes('"name":"shell_command"') ||
+      !shellDone[0].includes('"name":"shell_command"')) {
     throw new Error("ordinary shell stream transparency failed");
   }
   for (const part of [shellAdded, shellArgs, shellDone]) parseSseJsonEvents(part);
@@ -3434,49 +3476,67 @@ function selftest() {
   }));
   const completedParsed = parseSseJsonEvents(completedOut);
   if (completedParsed.length !== 1 || completedParsed[0]?.type !== "response.completed" ||
-    completedParsed[0]?.response?.id !== "resp_selftest" ||
-    completedParsed[0]?.response?.usage !== undefined ||
-    completedStream.sawCompletedForwarded !== true) {
+      completedParsed[0]?.response?.id !== "resp_selftest" ||
+      completedParsed[0]?.response?.usage !== undefined ||
+      completedStream.sawCompletedForwarded !== true) {
     throw new Error("response.completed framing/normalization failed");
   }
 
-  const expectedBudgets = { low: REASONING_BUDGET_LOW, medium: REASONING_BUDGET_MEDIUM, high: REASONING_BUDGET_HIGH, xhigh: REASONING_BUDGET_XHIGH };
-  for (const effort of SUPPORTED_REASONING_LEVELS) {
-    const prepared = prepareRequest({ model: "llm", input: "probe", reasoning: { effort } });
-    if (prepared.body.reasoning?.effort !== effort) {
-      throw new Error(`reasoning passthrough failed for ${effort}`);
+  if (usesTemplateThinking()) {
+    const expectedBudgets = { low: REASONING_BUDGET_LOW, medium: REASONING_BUDGET_MEDIUM, xhigh: REASONING_BUDGET_XHIGH };
+    for (const effort of ["low", "medium", "xhigh"]) {
+      const prepared = prepareRequest({ model: "llm", input: "probe", reasoning: { effort } });
+      if (prepared.body.reasoning?.effort !== effort) {
+        throw new Error(`reasoning passthrough failed for ${effort}`);
+      }
+      if (prepared.body.thinking_budget_tokens !== expectedBudgets[effort]) {
+        throw new Error(`reasoning budget failed for ${effort}: got ${prepared.body.thinking_budget_tokens}`);
+      }
     }
-    if (expectedBudgets[effort] > 0 && prepared.body.thinking_budget_tokens !== expectedBudgets[effort]) {
-      throw new Error(`reasoning budget failed for ${effort}: got ${prepared.body.thinking_budget_tokens}`);
+    const missingEffort = prepareRequest({ model: "llm", input: "probe" });
+    if (missingEffort.body.thinking_budget_tokens !== REASONING_BUDGET_XHIGH) {
+      throw new Error("missing-effort xhigh fallback budget failed");
     }
-  }
-  const missingEffort = prepareRequest({ model: "llm", input: "probe" });
-  const defaultBudget = reasoningBudgetForEffort(DEFAULT_REASONING_EFFORT);
-  if (defaultBudget > 0 && missingEffort.body.thinking_budget_tokens !== defaultBudget) {
-    throw new Error("missing-effort default budget failed");
-  }
-  const staleHigh = prepareRequest({ model: "llm", input: "probe", reasoning: { effort: "high" } });
-  if (REASONING_HIGH_MAP !== "high" && staleHigh.body.reasoning?.effort !== REASONING_HIGH_MAP) {
-    throw new Error("reasoning high-effort mapping failed");
+    const staleHigh = prepareRequest({ model: "llm", input: "probe", reasoning: { effort: "high" } });
+    if (staleHigh.body.reasoning?.effort !== "xhigh" || staleHigh.body.thinking_budget_tokens !== REASONING_BUDGET_XHIGH) {
+      throw new Error("stale Codex high -> Qwen3.8 xhigh compatibility mapping/budget failed");
+    }
+  } else {
+    const generic = prepareRequest({ model: "llm", input: "probe", reasoning: { effort: "high" } });
+    if (generic.body.reasoning !== undefined || generic.body.thinking_budget_tokens !== undefined) {
+      throw new Error("generic profile leaked reasoning fields");
+    }
   }
 
-  const profileDefaults = prepareRequest({ model: DEFAULT_MODEL, input: "probe", parallel_tool_calls: true });
-  if (FORCE_SERIAL_TOOL_CALLS && profileDefaults.body.parallel_tool_calls !== false) {
+  const qwenDefaults = prepareRequest({ model: "llm", input: "probe", parallel_tool_calls: true });
+  if (FORCE_SERIAL_TOOL_CALLS && qwenDefaults.body.parallel_tool_calls !== false) {
     throw new Error("serial tool-call enforcement failed");
   }
-  if (usesTemplateThinking(profileDefaults.body) &&
-    (profileDefaults.body.chat_template_kwargs?.enable_thinking !== true ||
-      profileDefaults.body.chat_template_kwargs?.preserve_thinking !== true)) {
-    throw new Error("template thinking defaults failed");
+  if (usesTemplateThinking() &&
+      (qwenDefaults.body.chat_template_kwargs?.enable_thinking !== true ||
+       qwenDefaults.body.chat_template_kwargs?.preserve_thinking !== true)) {
+    throw new Error("Qwen thinking/preserve_thinking template kwargs failed");
+  }
+  if (!usesTemplateThinking() && qwenDefaults.body.chat_template_kwargs !== undefined) {
+    throw new Error("generic profile leaked chat_template_kwargs");
   }
   const explicitThinking = prepareRequest({
     model: "llm",
     input: "probe",
     chat_template_kwargs: { enable_thinking: false, preserve_thinking: false }
   });
-  if (explicitThinking.body.chat_template_kwargs.enable_thinking !== false ||
-    explicitThinking.body.chat_template_kwargs.preserve_thinking !== false) {
+  if (usesTemplateThinking() &&
+      (explicitThinking.body.chat_template_kwargs.enable_thinking !== false ||
+       explicitThinking.body.chat_template_kwargs.preserve_thinking !== false)) {
     throw new Error("explicit Qwen chat_template_kwargs were overwritten");
+  }
+  if (!usesTemplateThinking() && explicitThinking.body.chat_template_kwargs !== undefined) {
+    throw new Error("generic profile retained explicit thinking kwargs");
+  }
+
+  const outputProbe = prepareRequest({ model: "llm", input: "probe", max_output_tokens: 999999 });
+  if (MAX_OUTPUT_TOKENS > 0 && outputProbe.body.max_output_tokens !== MAX_OUTPUT_TOKENS) {
+    throw new Error("normal output token cap failed");
   }
 
   // Progress-only assistant messages must never be converted into a fake
@@ -3555,15 +3615,15 @@ function selftest() {
     }
   })));
   if (FORWARD_TOOL_PROGRESS &&
-    (toolChatterCompleted.length !== 3 ||
-      toolChatterCompleted[0]?.type !== "response.output_item.added" ||
-      toolChatterCompleted[1]?.type !== "response.output_text.delta" ||
-      !toolChatterCompleted[2]?.response?.output?.some(x => x.type === "message"))) {
+      (toolChatterCompleted.length !== 3 ||
+       toolChatterCompleted[0]?.type !== "response.output_item.added" ||
+       toolChatterCompleted[1]?.type !== "response.output_text.delta" ||
+       !toolChatterCompleted[2]?.response?.output?.some(x => x.type === "message"))) {
     throw new Error("safe tool-progress forwarding failed");
   }
   if (!FORWARD_TOOL_PROGRESS &&
-    (toolChatterCompleted.length !== 1 ||
-      toolChatterCompleted[0]?.response?.output?.some(x => x.type === "message"))) {
+      (toolChatterCompleted.length !== 1 ||
+       toolChatterCompleted[0]?.response?.output?.some(x => x.type === "message"))) {
     throw new Error("disabled tool-progress suppression failed");
   }
 
@@ -3597,9 +3657,9 @@ function selftest() {
     response: { id: "resp_final", status: "completed", output: [] }
   })));
   if (finalMessageCompleted.length !== 3 ||
-    finalMessageCompleted[0]?.type !== "response.output_item.added" ||
-    finalMessageCompleted[1]?.type !== "response.output_text.delta" ||
-    finalMessageCompleted[2]?.type !== "response.completed") {
+      finalMessageCompleted[0]?.type !== "response.output_item.added" ||
+      finalMessageCompleted[1]?.type !== "response.output_text.delta" ||
+      finalMessageCompleted[2]?.type !== "response.completed") {
     throw new Error("final assistant message buffering failed");
   }
 
@@ -3657,12 +3717,10 @@ function selftest() {
   if (!isValidCompactionText(markdownCheckpoint)) {
     throw new Error("markdown compaction output validation failed");
   }
-  const preservedCheckpoint = buildCompactionRecoverySummary({
-    input: [{
-      role: "user",
-      content: [{ type: "input_text", text: `Another language model started to solve this problem.\n${markdownCheckpoint}` }]
-    }]
-  });
+  const preservedCheckpoint = buildCompactionRecoverySummary({ input: [{
+    role: "user",
+    content: [{ type: "input_text", text: `Another language model started to solve this problem.\n${markdownCheckpoint}` }]
+  }] });
   if (!isValidCompactionText(preservedCheckpoint) || preservedCheckpoint === markdownCheckpoint ||
     !preservedCheckpoint.includes("восстановительный fallback")) {
     throw new Error("stale checkpoint fallback detection failed");
@@ -3694,16 +3752,16 @@ function selftest() {
     throw new Error("checkpoint summary identity normalization failed");
   }
   CHECKPOINT_BY_SUMMARY.set(checkpointHash, "checkpoint-selftest.json");
-  const matchedCheckpoint = checkpointForRequest({ input: [{ role: "user", content: wrappedCheckpoint }] }, "missing", DEFAULT_MODEL);
+  const matchedCheckpoint = checkpointForRequest({ input: [{ role: "user", content: wrappedCheckpoint }] }, "missing", "llm");
   CHECKPOINT_BY_SUMMARY.delete(checkpointHash);
   if (matchedCheckpoint !== "checkpoint-selftest.json") {
     throw new Error("checkpoint summary identity lookup failed");
   }
-  CHECKPOINT_BY_KEY.set(`model:${DEFAULT_MODEL}`, "stale-model-checkpoint.json");
-  if (checkpointForRequest({ input: [{ role: "user", content: wrappedCheckpoint.replace("Task.", "Different task.") }] }, "missing", DEFAULT_MODEL) !== null) {
+  CHECKPOINT_BY_KEY.set("model:llm", "stale-model-checkpoint.json");
+  if (checkpointForRequest({ input: [{ role: "user", content: wrappedCheckpoint.replace("Task.", "Different task.") }] }, "missing", "llm") !== null) {
     throw new Error("stale model checkpoint contaminated an unrelated request");
   }
-  CHECKPOINT_BY_KEY.delete(`model:${DEFAULT_MODEL}`);
+  CHECKPOINT_BY_KEY.delete("model:llm");
   const recoverySummary = buildCompactionRecoverySummary({
     input: [{ role: "user", content: [{ type: "input_text", text: "Продолжить проверку проекта" }] }]
   });
@@ -3725,9 +3783,9 @@ function selftest() {
     response: { id: "resp_bad_compaction", status: "completed", output: [] }
   })));
   if (recoveredCompaction.length !== 7 ||
-    recoveredCompaction.some(event => JSON.stringify(event).includes("<tool_call>")) ||
-    recoveredCompaction[2]?.delta !== repairCompactionText("<tool_call><function=shell_command>", recoverySummary) ||
-    recoveredCompaction[6]?.response?.output?.[0]?.content?.[0]?.text !== repairCompactionText("<tool_call><function=shell_command>", recoverySummary)) {
+      recoveredCompaction.some(event => JSON.stringify(event).includes("<tool_call>")) ||
+      recoveredCompaction[2]?.delta !== repairCompactionText("<tool_call><function=shell_command>", recoverySummary) ||
+      recoveredCompaction[6]?.response?.output?.[0]?.content?.[0]?.text !== repairCompactionText("<tool_call><function=shell_command>", recoverySummary)) {
     throw new Error("invalid compaction recovery failed");
   }
 
@@ -3860,12 +3918,10 @@ function selftest() {
   if (!isCompactionRequest(compactProbe)) {
     throw new Error("compaction request detection failed");
   }
-  if (isCompactionRequest({
-    input: [
-      { role: "user", content: [{ type: "input_text", text: "Another language model started to solve this problem. CONTEXT CHECKPOINT SUMMARY" }] },
-      { role: "user", content: [{ type: "input_text", text: "Продолжай обычную работу" }] }
-    ]
-  })) {
+  if (isCompactionRequest({ input: [
+    { role: "user", content: [{ type: "input_text", text: "Another language model started to solve this problem. CONTEXT CHECKPOINT SUMMARY" }] },
+    { role: "user", content: [{ type: "input_text", text: "Продолжай обычную работу" }] }
+  ] })) {
     throw new Error("historical summary was misclassified as a compaction request");
   }
   const compactCapped = prepareRequest(compactProbe);
@@ -3891,9 +3947,9 @@ function selftest() {
   });
 
   if (mixedInstructions.body.input.some(x =>
-    x && typeof x === "object" &&
-    (String(x.role || "").toLowerCase() === "system" ||
-      String(x.role || "").toLowerCase() === "developer"))) {
+      x && typeof x === "object" &&
+      (String(x.role || "").toLowerCase() === "system" ||
+       String(x.role || "").toLowerCase() === "developer"))) {
     throw new Error("system/developer message remained in Responses history");
   }
   if (!mixedInstructions.body.instructions.startsWith("BASE INSTRUCTIONS\n\nMID SYSTEM\n\nDEV RULES")) {
@@ -3910,9 +3966,9 @@ function selftest() {
     throw new Error("instruction normalization count failed");
   }
   if (mixedInstructions.body.input.length !== 3 ||
-    mixedInstructions.body.input[0].role !== "user" ||
-    mixedInstructions.body.input[1].role !== "assistant" ||
-    mixedInstructions.body.input[2].role !== "user") {
+      mixedInstructions.body.input[0].role !== "user" ||
+      mixedInstructions.body.input[1].role !== "assistant" ||
+      mixedInstructions.body.input[2].role !== "user") {
     throw new Error("instruction normalization changed ordinary history order");
   }
 
@@ -3936,6 +3992,23 @@ function selftest() {
     !texts.includes("CURRENT USER REQUEST: fix the collision regression exactly") ||
     !postCompact.input.some(isCompactionSummaryItem)) {
     throw new Error("post-compaction pruning lost current task/canonical context or kept stale user history");
+  }
+  const preCompact = {
+    instructions: "BASE",
+    input: [
+      { role: "developer", content: "DEVELOPER BEFORE SUMMARY" },
+      { type: "function_call", call_id: "old_call", name: "read_file", arguments: "{}" },
+      { type: "function_call_output", call_id: "old_call", output: "old tool output" },
+      { role: "user", content: summaryPrefix + "\nsummary" },
+      { role: "user", content: "continue current task" },
+      { type: "function_call_output", call_id: "new_call", output: "new tool output" }
+    ]
+  };
+  const prePrune = prunePreCompactionHistory(preCompact);
+  if (!prePrune.foundSummary || prePrune.removed !== 3 || preCompact.input.length !== 3 ||
+      !preCompact.instructions.includes("DEVELOPER BEFORE SUMMARY") ||
+      preCompact.input.some(item => item.call_id === "old_call")) {
+    throw new Error(`pre-compaction tool history pruning failed: ${JSON.stringify(prePrune)}`);
   }
   const postCompactTools = {
     instructions: "BASE",
@@ -3975,12 +4048,17 @@ function selftest() {
     throw new Error("post-compaction continuation rule failed");
   }
 
-  if (compactCapped.body.reasoning?.effort !== COMPACT_REASONING_EFFORT ||
-    (COMPACT_REASONING_BUDGET > 0 && compactCapped.body.thinking_budget_tokens !== COMPACT_REASONING_BUDGET) ||
-    (usesTemplateThinking(compactCapped.body) && compactCapped.body.chat_template_kwargs?.enable_thinking !== false) ||
-    (usesTemplateThinking(compactCapped.body) && compactCapped.body.chat_template_kwargs?.preserve_thinking !== false) ||
-    compactCapped.body.tool_choice !== "none" ||
-    compactCapped.body.parallel_tool_calls !== false) {
+  if ((usesTemplateThinking() &&
+       (compactCapped.body.reasoning?.effort !== COMPACT_REASONING_EFFORT ||
+        compactCapped.body.thinking_budget_tokens !== COMPACT_REASONING_BUDGET ||
+        compactCapped.body.chat_template_kwargs?.enable_thinking !== false ||
+        compactCapped.body.chat_template_kwargs?.preserve_thinking !== false)) ||
+      (!usesTemplateThinking() &&
+       (compactCapped.body.reasoning !== undefined ||
+        compactCapped.body.thinking_budget_tokens !== undefined ||
+        compactCapped.body.chat_template_kwargs !== undefined)) ||
+      compactCapped.body.tool_choice !== "none" ||
+      compactCapped.body.parallel_tool_calls !== false) {
     throw new Error("compaction non-thinking/serial/no-tools policy failed");
   }
 
