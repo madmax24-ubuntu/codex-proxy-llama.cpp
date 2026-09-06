@@ -31,7 +31,8 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.52";
+const VERSION = "1.0.53";
+const SELFTEST_MODE = process.argv.includes("--selftest");
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
 const UPSTREAM = new URL(process.env.LLAMA_UPSTREAM || "http://127.0.0.1:8080");
@@ -79,7 +80,7 @@ let CACHED_MCP_NAMESPACES = [];
 
 function log(...a) { console.log("[codex-llama-proxy]", ...a); }
 function debug(...a) { if (DEBUG) console.log("[codex-llama-proxy:debug]", ...a); }
-function diag(line) { try { fs.appendFileSync(DIAG_PATH, `[${new Date().toISOString()}] ${line}\n`); } catch { } }
+function diag(line) { if (SELFTEST_MODE) return; try { fs.appendFileSync(DIAG_PATH, `[${new Date().toISOString()}] ${line}\n`); } catch { } }
 function clone(x) { return JSON.parse(JSON.stringify(x)); }
 
 function safeMkdir(dir) {
