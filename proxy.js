@@ -31,7 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const VERSION = "1.0.54";
+const VERSION = "1.0.55";
 const SELFTEST_MODE = process.argv.includes("--selftest");
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_PROXY_PORT || "8181");
@@ -1470,6 +1470,9 @@ function appendPostCompactContinuationRule(body) {
 - Files, functions, architecture, and tool results documented under WORK COMPLETED or STATE SNAPSHOT are already known. Do not reread entire files or repeat broad discovery after compaction; inspect only a precise missing range required for the next edit.
 - Scope destructive actions literally: removing a project/index mentioned together with an MCP means removing its MCP record only. Never delete filesystem files or directories unless the user explicitly requests filesystem deletion.
 - DO NOT start from scratch with general greetings or exploratory inspections (e.g. "Понял ситуацию, проведу диагностику").
+- Before the first post-compaction action, use the checkpoint CURRENT TASK/WORK COMPLETED/NEXT ACTION and the injected EPISODIC KNOWLEDGE; do not rediscover the whole task or repeatedly query the memory store.
+- For source-code work, the first discovery action after compaction MUST be exactly one matching Codebase Memory graph call. Only after its result is insufficient may you read a precise file range with shell.
+- If the same file, symbol, command, or MCP query was already executed and produced no new result, do not repeat it; choose a different targeted check or report the concrete blocker.
 - Continue from NEXT ACTION when consistent with the latest user request and tool results. Resolve contradictions with a targeted check, never a full restart of discovery. Reply to the user in Russian, including progress messages. Tool names and code remain unchanged.`;
   const instructions = String(body.instructions || "").trim();
   if (instructions.includes(marker)) return false;
