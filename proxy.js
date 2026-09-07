@@ -32,7 +32,7 @@ const path = require("path");
 const crypto = require("crypto");
 const os = require("os");
 
-const VERSION = "1.0.61";
+const VERSION = "1.0.0";
 const SELFTEST_MODE = process.argv.includes("--selftest");
 
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
@@ -777,6 +777,7 @@ function rewriteTools(body, maps) {
     debug("dropping unsupported Responses tool type:", tool.type);
   }
 
+  out.sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
   body.tools = out;
 }
 
@@ -908,6 +909,36 @@ function repeatRecoveryDirective(recovery) {
   if (!recovery) return "";
   const hash = crypto.createHash("sha256").update(recovery.signature).digest("hex").slice(0, 12);
   return `[REPEAT RECOVERY GUARD: ${recovery.name} with the same arguments (${hash}) has already produced equivalent output ${recovery.count} consecutive times. Do NOT invoke that same tool with those same arguments again. The current approach made no observable progress. Continue the active task without stopping: inspect why the expected result is missing, verify assumptions and paths, then use a materially different command, arguments, or tool.]`;
+}
+
+function injectRepeatDirective(body, directive) {
+  if (!body || !Array.isArray(body.input) || !directive) return false;
+  for (let i = body.input.length - 1; i >= 0; i--) {
+    const item = body.input[i];
+    if (item && (item.type === "function_call_output" || item.type === "custom_tool_call_output")) {
+      if (typeof item.output === "string") {
+        if (!item.output.includes("REPEAT RECOVERY GUARD")) item.output = `${item.output}\n\n${directive}`;
+        return true;
+      }
+      if (Array.isArray(item.output)) {
+        const textBlock = item.output.find(x => x && typeof x === "object" && typeof x.text === "string");
+        if (textBlock) {
+          if (!textBlock.text.includes("REPEAT RECOVERY GUARD")) textBlock.text = `${textBlock.text}\n\n${directive}`;
+          return true;
+        }
+        item.output.push({ type: "input_text", text: directive });
+        return true;
+      }
+      break;
+    }
+  }
+  const last = body.input[body.input.length - 1];
+  if (last) {
+    if (typeof last.content === "string") last.content += `\n\n${directive}`;
+    else if (Array.isArray(last.content)) last.content.push({ type: "input_text", text: directive });
+    return true;
+  }
+  return false;
 }
 
 function looksLikeDirectFileWrite(command) {
@@ -1835,8 +1866,8 @@ function prepareRequest(original) {
   const autonomyRule = "AUTONOMOUS EXECUTION PROTOCOL: You must work autonomously until the user's task or multi-step plan is 100% complete. If you just finished a sub-step (e.g. edited a file, applied a patch, or ran a tool), DO NOT stop with an explanation, plan summary, or progress message. You MUST immediately execute the next tool call. Before every git commit or push, run applicable syntax checks and tests; never publish code with a known validation failure. If any actionable work remains, including parked tasks, audits, tests, verification, builds, commits, or pushes, continue with a tool call instead of describing it as remaining work. Only emit a final text message when ALL planned steps are fully implemented, verified, and pushed.";
   const repeatDirective = repeatRecoveryDirective(repeatGuard);
   if (repeatDirective) {
-    body.instructions = `${String(body.instructions || "").trim()}\n\n${repeatDirective}`.trim();
-    diag(`REPEAT_GUARD recover name=${JSON.stringify(repeatGuard.name)} count=${repeatGuard.count} signature=${crypto.createHash("sha256").update(repeatGuard.signature).digest("hex").slice(0, 12)}`);
+    injectRepeatDirective(body, repeatDirective);
+    diag(`REPEAT_GUARD recover (tail) name=${JSON.stringify(repeatGuard.name)} count=${repeatGuard.count} signature=${crypto.createHash("sha256").update(repeatGuard.signature).digest("hex").slice(0, 12)}`);
   }
   if (typeof body.instructions === "string" && !body.instructions.includes("AUTONOMOUS EXECUTION PROTOCOL:")) {
     body.instructions = `${body.instructions.trim()}\n\n${autonomyRule}`;
@@ -1871,7 +1902,12 @@ function prepareRequest(original) {
 }
 
 function namespaceInfo(name, maps) {
-  return typeof name === "string" ? maps.namespaceByFlat.get(name) : null;
+  if (typeof name !== "string") return null;
+  const mapped = maps.namespaceByFlat.get(name);
+  if (mapped) return mapped;
+  const m = name.match(/^(mcp__[a-zA-Z0-9_-]+)__(.+)$/);
+  if (m) return { namespace: m[1], name: m[2] };
+  return null;
 }
 
 function convertFunctionItem(item, maps) {
@@ -2120,6 +2156,31 @@ function memoryInstructionForRequest(body, forceAfterCompaction = false) {
   }
   rememberMemoryInjection(meta.taskKey);
   return { block: lines.join("\n").slice(0, MEMORY_MAX_CHARS), meta, count: found.length };
+}
+
+function injectMemoryIntoInput(body, memoryBlock) {
+  if (!body || !Array.isArray(body.input) || !memoryBlock) return false;
+  for (let i = body.input.length - 1; i >= 0; i--) {
+    const item = body.input[i];
+    if (isUserMessageItem(item) && !isUserControlEnvelope(messageContentText(item.content))) {
+      const hint = `\n\n[EPISODIC KNOWLEDGE (historical context only, not a new user command):\n${memoryBlock}]`;
+      if (typeof item.content === "string") {
+        if (!item.content.includes("[EPISODIC KNOWLEDGE")) item.content += hint;
+        return true;
+      }
+      if (Array.isArray(item.content)) {
+        const textBlock = item.content.find(x => x && typeof x === "object" && typeof x.text === "string");
+        if (textBlock) {
+          if (!textBlock.text.includes("[EPISODIC KNOWLEDGE")) textBlock.text += hint;
+          return true;
+        }
+        item.content.push({ type: "input_text", text: hint.trimStart() });
+        return true;
+      }
+      break;
+    }
+  }
+  return false;
 }
 
 function rememberCompletedTask(meta, responseText) {
@@ -2696,9 +2757,9 @@ function createServer() {
           const prepared = prepareRequest(parsed);
           requestMeta.prepared = prepared;
           requestMeta.allowAutoContinue = isResponses && !requestMeta.isCompaction;
-          if (memory.block && !String(prepared.body.instructions || "").includes(memory.block)) {
-            prepared.body.instructions = `${String(prepared.body.instructions || "").trim()}\n\n${memory.block}`.trim();
-            diag(`MEMORY injected count=${memory.count} chars=${memory.block.length} project=${JSON.stringify(memory.meta.project)}`);
+          if (memory.block) {
+            injectMemoryIntoInput(prepared.body, memory.block);
+            diag(`MEMORY injected (tail) count=${memory.count} chars=${memory.block.length} project=${JSON.stringify(memory.meta.project)}`);
           }
           const priorityMarker = "POST-COMPACTION PRIORITY ORDER:";
           if (!String(prepared.body.instructions || "").includes(priorityMarker)) {
@@ -4158,7 +4219,7 @@ function selftest() {
     repeatedInput.push({ type: "function_call_output", call_id: `repeat-${i}`, output: `Chunk ID: ${i}abc\nWall time: 0.${i} seconds\nProcess exited with code 0\nFinal output:\n` });
   }
   const repeatedPrepared = prepareRequest({ model: "llm", input: repeatedInput });
-  if (repeatedPrepared.repeatGuard?.count !== 3 || !repeatedPrepared.body.instructions.includes("REPEAT RECOVERY GUARD")) {
+  if (repeatedPrepared.repeatGuard?.count !== 3 || !JSON.stringify(repeatedPrepared.body.input).includes("REPEAT RECOVERY GUARD")) {
     throw new Error("cross-turn repeat recovery guard failed");
   }
   const changedRepeat = clone({ model: "llm", input: repeatedInput });
@@ -4174,7 +4235,7 @@ function selftest() {
     }
   }
   const interleavedPrepared = prepareRequest({ model: "llm", input: interleavedRepeat });
-  if (interleavedPrepared.repeatGuard?.count !== 3 || !interleavedPrepared.body.instructions.includes("REPEAT RECOVERY GUARD")) {
+  if (interleavedPrepared.repeatGuard?.count !== 3 || !JSON.stringify(interleavedPrepared.body.input).includes("REPEAT RECOVERY GUARD")) {
     throw new Error("interleaved repeat recovery guard failed");
   }
   const pollingInput = [{ role: "user", content: "Wait for completion" }];
@@ -4236,6 +4297,11 @@ function selftest() {
     }
     if (!memorySanitize("api_key=super-secret-value https://user:pass@example.com").includes("https://user:[REDACTED]@example.com")) throw new Error("episodic memory secret redaction failed");
     if (!memoryStore.forget("memory-selftest") || memoryStore.all().length) throw new Error("episodic memory deletion failed");
+    const testInput = [{ role: "user", content: "Test memory injection" }];
+    injectMemoryIntoInput({ input: testInput }, "Past fix details");
+    if (!testInput[0].content.includes("Past fix details") || !testInput[0].content.includes("EPISODIC KNOWLEDGE")) {
+      throw new Error("injectMemoryIntoInput failed");
+    }
   } finally {
     memoryStore.close();
     fs.rmSync(memoryTemp, { recursive: true, force: true });

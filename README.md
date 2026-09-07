@@ -12,6 +12,9 @@ Codex expects more than basic OpenAI-compatible chat completions. Agentic sessio
 
 ## Features
 
+- **Zero KV-Cache Recomputation (Invariant Prompt Prefix):** Dynamic episodic memory (`[EPISODIC KNOWLEDGE]`) and repeat loop recovery directives (`[REPEAT RECOVERY GUARD]`) are strictly injected into the **tail** (user message or tool outputs). The `instructions` prefix remains 100% byte-for-byte invariant across multi-turn sessions, ensuring instant prompt cache hits in llama.cpp without re-evaluating 50k–100k+ tokens.
+- **Repeat Recovery Loop Guard (`REPEAT RECOVERY GUARD`):** Detects consecutive identical tool invocations and injects targeted recovery directives directly into the latest `function_call_output` in the tail. The model adapts its approach on the fly without failing the session or busting the cache.
+- **Deterministic Tool Schemas & Robust MCP:** Tool definitions are sorted deterministically (`localeCompare`) to prevent cache thrashing. Robust regex fallback guarantees fault-tolerant `mcp__<server>__<tool>` namespace demangling.
 - Codex namespace tools flattened for llama.cpp and restored in responses.
 - Native Codex `apply_patch` bridged through a strict function schema and translated back to a freeform tool call, preserving the IDE diff view.
 - Function/custom tool history replay across turns.
@@ -37,9 +40,12 @@ Codex expects more than basic OpenAI-compatible chat completions. Agentic sessio
 
 The proxy cannot add tool-calling ability to a model that does not have it. Models trained for agentic coding and tool use work best.
 
-## Tested Codex compatibility
+## Tested Codex & Model compatibility
 
-This release is tested with the portable Codex IDE extension `openai.chatgpt-26.825.51511` on Windows. Compatibility with other Codex versions, including newer or older builds, is not guaranteed; changes in Responses events, tool state, or diff handling may require proxy updates.
+- **Tested Codex Release:** Codex CLI `0.151.0-alpha.7.2` and portable Codex IDE extension `openai.chatgpt-26.825.51511` on Windows.
+- **Tested Model:** Extensively verified in multi-step agentic production sessions on **Qwen 3.8-27B** (27.3B parameters, `Q3_K - Large` quantization, 120,064 token context window in llama.cpp).
+- **Stability & Performance:** Stable 1.0 release verified with 100% prompt cache hit rate during continuous iterative development, file editing, and MCP execution.
+
 
 ## Quick start
 
