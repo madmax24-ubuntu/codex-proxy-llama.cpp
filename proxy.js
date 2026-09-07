@@ -30,8 +30,9 @@ const zlib = require("zlib");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const os = require("os");
 
-const VERSION = "1.0.60";
+const VERSION = "1.0.61";
 const SELFTEST_MODE = process.argv.includes("--selftest");
 
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";
@@ -1026,12 +1027,18 @@ function isCompactionInstructionText(text) {
   return /CONTEXT CHECKPOINT (?:SUMMARY|COMPACTION)|Create a handoff summary for another LLM|continuation handoff for the next model/i.test(text || "");
 }
 
+function isAgentsInstructionEnvelope(text) {
+  const value = String(text || "").trimStart();
+  return /^#\s*AGENTS\.md instructions\b/i.test(value) ||
+    /^<INSTRUCTIONS>(?:\s|$)/i.test(value) ||
+    /###\s*ROLE:\s*AUTONOMOUS PRAGMATIC ENGINEER/i.test(value);
+}
+
 function isUserControlEnvelope(text) {
   const value = String(text || "").trimStart();
   return isCompactionInstructionText(value) ||
     COMPACT_SUMMARY_PREFIXES.some(prefix => value.startsWith(prefix)) ||
-    /^#\s*AGENTS\.md instructions\b/i.test(value) ||
-    /^<INSTRUCTIONS>(?:\s|$)/i.test(value) ||
+    isAgentsInstructionEnvelope(value) ||
     /^<environment_context>(?:\s|$)/i.test(value) ||
     /^<turn_aborted>(?:\s|$)/i.test(value) ||
     /^\[SYSTEM:/i.test(value);
@@ -1440,8 +1447,9 @@ function prunePreCompactionHistory(body) {
   const preservedInstructions = [];
   for (const item of body.input.slice(0, summaryIndex)) {
     const role = String(item?.role || "").toLowerCase();
-    if ((role === "system" || role === "developer") && messageContentText(item.content)) {
-      preservedInstructions.push(messageContentText(item.content));
+    const text = messageContentText(item?.content);
+    if ((role === "system" || role === "developer" || isAgentsInstructionEnvelope(text)) && text) {
+      preservedInstructions.push(text);
     }
   }
   if (preservedInstructions.length) {
@@ -1603,11 +1611,12 @@ function normalizeInstructionMessages(body) {
     const role = item && typeof item === "object" && typeof item.role === "string"
       ? item.role.toLowerCase()
       : "";
+    const text = messageContentText(item?.content);
 
-    if (role === "system" || role === "developer") {
+    if (role === "system" || role === "developer" || (role === "user" && isAgentsInstructionEnvelope(text))) {
       moved += 1;
-      roles.push(role);
-      addPiece(messageContentText(item.content));
+      roles.push(role === "user" ? "user:agents" : role);
+      addPiece(text);
       continue;
     }
 
@@ -1620,6 +1629,49 @@ function normalizeInstructionMessages(body) {
   }
 
   return { moved, roles };
+}
+
+function loadGlobalAgentsMarkdown() {
+  const candidates = [
+    process.env.CODEX_HOME ? path.join(process.env.CODEX_HOME, "AGENTS.md") : null,
+    path.join(__dirname, "AGENTS.md"),
+    os.homedir() ? path.join(os.homedir(), ".codex", "AGENTS.md") : null
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) {
+        const text = fs.readFileSync(candidate, "utf8").trim();
+        if (text) return text;
+      }
+    } catch {}
+  }
+  return "";
+}
+
+let cachedGlobalAgents = null;
+let lastAgentsCheck = 0;
+function getGlobalAgentsInstructions() {
+  const now = Date.now();
+  if (cachedGlobalAgents === null || (now - lastAgentsCheck) > 5000) {
+    cachedGlobalAgents = loadGlobalAgentsMarkdown();
+    lastAgentsCheck = now;
+  }
+  return cachedGlobalAgents;
+}
+
+function ensureGlobalAgentsInstructions(body) {
+  if (!body || typeof body !== "object") return false;
+  const current = typeof body.instructions === "string" ? body.instructions : "";
+  if (isAgentsInstructionEnvelope(current) || current.includes("ROLE: AUTONOMOUS PRAGMATIC ENGINEER")) {
+    return false;
+  }
+  const globalAgents = getGlobalAgentsInstructions();
+  if (!globalAgents) return false;
+  body.instructions = current
+    ? `${current}\n\n# AGENTS.md instructions\n\n<INSTRUCTIONS>\n${globalAgents}\n</INSTRUCTIONS>`
+    : `# AGENTS.md instructions\n\n<INSTRUCTIONS>\n${globalAgents}\n</INSTRUCTIONS>`;
+  return true;
 }
 
 function pruneOrphanProgressMessages(body) {
@@ -1779,6 +1831,7 @@ function prepareRequest(original) {
 
   const reasoningNormalization = normalizeReasoningEffort(body);
   const instructionNormalization = normalizeInstructionMessages(body);
+  ensureGlobalAgentsInstructions(body);
   const autonomyRule = "AUTONOMOUS EXECUTION PROTOCOL: You must work autonomously until the user's task or multi-step plan is 100% complete. If you just finished a sub-step (e.g. edited a file, applied a patch, or ran a tool), DO NOT stop with an explanation, plan summary, or progress message. You MUST immediately execute the next tool call. Before every git commit or push, run applicable syntax checks and tests; never publish code with a known validation failure. If any actionable work remains, including parked tasks, audits, tests, verification, builds, commits, or pushes, continue with a tool call instead of describing it as remaining work. Only emit a final text message when ALL planned steps are fully implemented, verified, and pushed.";
   const repeatDirective = repeatRecoveryDirective(repeatGuard);
   if (repeatDirective) {
@@ -3970,6 +4023,39 @@ function selftest() {
       mixedInstructions.body.input[1].role !== "assistant" ||
       mixedInstructions.body.input[2].role !== "user") {
     throw new Error("instruction normalization changed ordinary history order");
+  }
+
+  const agentsUserRequest = prepareRequest({
+    model: "llm",
+    instructions: "BASE INSTRUCTIONS",
+    input: [
+      { role: "user", content: [{ type: "input_text", text: "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n### ROLE: AUTONOMOUS PRAGMATIC ENGINEER\nDo work.\n</INSTRUCTIONS>" }] },
+      { role: "user", content: "Implement the feature" }
+    ]
+  });
+  if (agentsUserRequest.body.input.length !== 1 || agentsUserRequest.body.input[0].content !== "Implement the feature") {
+    throw new Error("agents user envelope extraction failed");
+  }
+  if (!agentsUserRequest.body.instructions.includes("ROLE: AUTONOMOUS PRAGMATIC ENGINEER")) {
+    throw new Error("agents instruction not moved to instructions");
+  }
+
+  const compactWithAgents = prepareRequest({
+    model: "llm",
+    instructions: "BASE INSTRUCTIONS",
+    input: [
+      { role: "user", content: "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n### ROLE: AUTONOMOUS PRAGMATIC ENGINEER\nDo work.\n</INSTRUCTIONS>" },
+      { role: "user", content: "Initial task" },
+      { role: "assistant", content: "Working..." },
+      { role: "user", content: `${COMPACT_SUMMARY_PREFIXES[0]}\n${validCheckpoint}` },
+      { role: "user", content: "Continue work" }
+    ]
+  });
+  if (!compactWithAgents.body.instructions.includes("ROLE: AUTONOMOUS PRAGMATIC ENGINEER")) {
+    throw new Error("agents instructions missing after compaction");
+  }
+  if (compactWithAgents.body.input.some(x => messageContentText(x && x.content).includes("ROLE: AUTONOMOUS PRAGMATIC ENGINEER"))) {
+    throw new Error("agents envelope remained in compacted input history");
   }
 
   const summaryPrefix = COMPACT_SUMMARY_PREFIXES[0];
