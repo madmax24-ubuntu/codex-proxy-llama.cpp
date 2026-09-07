@@ -21,6 +21,7 @@ Codex expects more than basic OpenAI-compatible chat completions. Agentic sessio
 - Fresh-tail recovery metadata instead of silently reusing a stale checkpoint when compaction output is invalid.
 - Persistent project-scoped episodic memory with evidence-gated writes, relevance retrieval, secret redaction, and a bounded prompt footprint.
 - Pre-commit validation instructions for agentic sessions.
+- Full `AGENTS.md` lifecycle protection: automatically normalizes instruction envelopes from user/developer/system turns into top-level system instructions, preserves them across context compactions, and provides dynamic disk fallback loading.
 - Exact effective-context calculation from llama.cpp `n_ctx`.
 - Qwen and generic reasoning profiles with configurable budgets.
 - Interactive and fully non-interactive Python installer.
