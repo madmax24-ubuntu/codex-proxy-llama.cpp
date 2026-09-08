@@ -12,13 +12,16 @@
  * Usage:
  *   node set_context_size.js 120064
  *   node set_context_size.js 128k
- *   node set_context_size.js 64k --vision=off
- *   node set_context_size.js 32000 --vision=on
+ *   node set_context_size.js 64k vision off
+ *   node set_context_size.js vision on
+ *   node set_context_size.js vision off
  *   node set_context_size.js --status
+ *   node set_context_size.js (interactive menu if run with no args)
  */
 
 const fs = require("fs");
 const path = require("path");
+const readline = require("readline");
 
 function parseTokens(arg) {
   if (!arg) return null;
@@ -83,89 +86,79 @@ function updateFile(filePath, regex, replacement) {
   return false;
 }
 
-function main() {
-  const args = process.argv.slice(2);
-  let requestedTokens = null;
-  let visionToggle = null; // null: unchanged, true: on, false: off
-  let dryRun = false;
-  let showStatus = false;
+function getCurrentConfig(codexHome, vscodeRoot) {
+  const configTomlPath = path.join(codexHome, "config.toml");
+  const batPath = path.join(vscodeRoot, "Start-Codex-Qwen-v16.bat");
+  const catalogPath = path.join(codexHome, "model_catalog.json");
 
-  for (const arg of args) {
-    if (arg === "--status" || arg === "-s") {
-      showStatus = true;
-    } else if (arg === "--dry-run") {
-      dryRun = true;
-    } else if (arg === "--vision=on" || arg === "--vision" || arg === "--enable-vision") {
-      visionToggle = true;
-    } else if (arg === "--vision=off" || arg === "--no-vision" || arg === "--disable-vision") {
-      visionToggle = false;
-    } else if (!arg.startsWith("-") && requestedTokens == null) {
-      requestedTokens = parseTokens(arg);
-    }
+  let contextWindow = null;
+  let autoCompact = null;
+  let pruneTokens = null;
+  let visionEnabled = true;
+
+  if (fs.existsSync(configTomlPath)) {
+    const text = fs.readFileSync(configTomlPath, "utf8");
+    const m1 = text.match(/model_context_window\s*=\s*(\d+)/);
+    if (m1) contextWindow = parseInt(m1[1], 10);
+    const m2 = text.match(/model_auto_compact_token_limit\s*=\s*(\d+)/);
+    if (m2) autoCompact = parseInt(m2[1], 10);
   }
 
-  const { codexHome, vscodeRoot } = resolveDirectories();
-  if (!codexHome) {
-    console.error("Error: could not find codex-home directory (config.toml / model_catalog.json)");
-    process.exit(1);
+  if (fs.existsSync(batPath)) {
+    const text = fs.readFileSync(batPath, "utf8");
+    const m3 = text.match(/set\s+"CODEX_POST_COMPACT_PRUNE_TRIGGER_TOKENS=(\d+)"/i);
+    if (m3) pruneTokens = parseInt(m3[1], 10);
+    const m4 = text.match(/set\s+"CODEX_VISION_ENABLED=([01])"/i);
+    if (m4) visionEnabled = m4[1] === "1";
   }
 
+  if (fs.existsSync(catalogPath)) {
+    try {
+      const cat = JSON.parse(fs.readFileSync(catalogPath, "utf8"));
+      const m = (cat.models || []).find(x => x.slug === "llm" || x.id === "llm");
+      if (m && Array.isArray(m.supported_media_types)) {
+        visionEnabled = m.supported_media_types.includes("image");
+      }
+    } catch {}
+  }
+
+  return { contextWindow, autoCompact, pruneTokens, visionEnabled };
+}
+
+function applyConfiguration(codexHome, vscodeRoot, requestedTokens, visionToggle, dryRun = false) {
   const configTomlPath = path.join(codexHome, "config.toml");
   const catalogPath = path.join(codexHome, "model_catalog.json");
   const prepareConfigPath = path.join(codexHome, "prepare_config.js");
   const batPath = path.join(vscodeRoot, "Start-Codex-Qwen-v16.bat");
 
-  // Read current values
-  let currentConfigContext = null;
-  let currentConfigAutoCompact = null;
-  if (fs.existsSync(configTomlPath)) {
-    const text = fs.readFileSync(configTomlPath, "utf8");
-    const m1 = text.match(/model_context_window\s*=\s*(\d+)/);
-    if (m1) currentConfigContext = parseInt(m1[1], 10);
-    const m2 = text.match(/model_auto_compact_token_limit\s*=\s*(\d+)/);
-    if (m2) currentConfigAutoCompact = parseInt(m2[1], 10);
-  }
-
-  if (showStatus || (requestedTokens == null && visionToggle == null)) {
-    console.log("========================================================");
-    console.log("  Codex + llama.cpp Context & Vision Configuration");
-    console.log("========================================================");
-    console.log(`Codex Home:     ${codexHome}`);
-    console.log(`VS Code Root:   ${vscodeRoot}`);
-    console.log(`Current Config:`);
-    console.log(`  model_context_window:           ${currentConfigContext || "unknown"}`);
-    console.log(`  model_auto_compact_token_limit: ${currentConfigAutoCompact || "unknown"}`);
-    console.log("\nUsage:");
-    console.log("  node set_context_size.js <tokens> [--vision=on|off] [--dry-run]");
-    console.log("\nExamples:");
-    console.log("  node set_context_size.js 120064");
-    console.log("  node set_context_size.js 128k");
-    console.log("  node set_context_size.js 64000 --vision=off");
-    console.log("  node set_context_size.js 32k");
-    console.log("  node set_context_size.js --vision=off");
-    process.exit(0);
-  }
-
-  const targetLive = requestedTokens || Math.floor((currentConfigContext || 126383) * 0.95);
+  const current = getCurrentConfig(codexHome, vscodeRoot);
+  const targetLive = requestedTokens || Math.floor((current.contextWindow || 126383) * 0.95);
   const params = calculateContextParameters(targetLive);
 
+  console.log("\n========================================================");
+  console.log("  Calculated Configuration Thresholds");
   console.log("========================================================");
-  console.log("  Calculated Context & Compaction Parameters");
-  console.log("========================================================");
-  console.log(`Target Live Context (n_ctx):       ${params.liveContext.toLocaleString()} tokens`);
-  console.log(`Configured Context Window:         ${params.configuredContext.toLocaleString()} tokens`);
-  console.log(`Effective Window (${params.effectivePercent}%):             ${params.effectiveContext.toLocaleString()} tokens`);
-  console.log(`Auto-Compact Trigger (90%):        ${params.autoCompactTokenLimit.toLocaleString()} tokens`);
-  console.log(`Post-Compact Prune Trigger (93%):  ${params.pruneTriggerTokens.toLocaleString()} tokens`);
-  console.log(`Guaranteed Response Safety Margin: ${(params.liveContext - params.autoCompactTokenLimit).toLocaleString()} tokens`);
+  if (requestedTokens != null) {
+    console.log(`Target Live Context (n_ctx):       ${params.liveContext.toLocaleString()} tokens`);
+    console.log(`Configured Context Window:         ${params.configuredContext.toLocaleString()} tokens`);
+    console.log(`Effective Window (${params.effectivePercent}%):             ${params.effectiveContext.toLocaleString()} tokens`);
+    console.log(`Auto-Compact Trigger (90%):        ${params.autoCompactTokenLimit.toLocaleString()} tokens`);
+    console.log(`Post-Compact Prune Trigger (93%):  ${params.pruneTriggerTokens.toLocaleString()} tokens`);
+    console.log(`Safety Response Cushion:           ${(params.liveContext - params.autoCompactTokenLimit).toLocaleString()} tokens`);
+  } else {
+    console.log(`Context Window:                    Unchanged (${(current.contextWindow || 126383).toLocaleString()} tokens)`);
+  }
+
   if (visionToggle !== null) {
-    console.log(`Multimodal Vision:                 ${visionToggle ? "ENABLED (image_url enabled)" : "DISABLED (graceful text replacement)"}`);
+    console.log(`Multimodal Vision Support:         ${visionToggle ? "ENABLED (image_url enabled for Vision models)" : "DISABLED (graceful text replacement for text-only models)"}`);
+  } else {
+    console.log(`Multimodal Vision Support:         ${current.visionEnabled ? "ENABLED" : "DISABLED"}`);
   }
   console.log("========================================================");
 
   if (dryRun) {
-    console.log("[Dry-run] No files modified.");
-    process.exit(0);
+    console.log("[Dry-run mode] No files were modified.\n");
+    return;
   }
 
   const modified = [];
@@ -234,6 +227,12 @@ function main() {
       if (updateFile(batPath, /set\s+"CODEX_POST_COMPACT_PRUNE_TRIGGER_TOKENS=\d+"/, `set "CODEX_POST_COMPACT_PRUNE_TRIGGER_TOKENS=${params.pruneTriggerTokens}"`)) {
         batChanged = true;
       }
+      if (/set\s+"CODEX_CONTEXT_WINDOW=\d+"/i.test(fs.readFileSync(batPath, "utf8"))) {
+        if (updateFile(batPath, /set\s+"CODEX_CONTEXT_WINDOW=\d+"/i, `set "CODEX_CONTEXT_WINDOW=${params.configuredContext}"`)) batChanged = true;
+      }
+      if (/set\s+"CODEX_AUTO_COMPACT_LIMIT=\d+"/i.test(fs.readFileSync(batPath, "utf8"))) {
+        if (updateFile(batPath, /set\s+"CODEX_AUTO_COMPACT_LIMIT=\d+"/i, `set "CODEX_AUTO_COMPACT_LIMIT=${params.autoCompactTokenLimit}"`)) batChanged = true;
+      }
     }
     if (visionToggle !== null) {
       const visionVal = visionToggle ? "1" : "0";
@@ -241,7 +240,7 @@ function main() {
         if (updateFile(batPath, /set\s+"CODEX_VISION_ENABLED=[01]"/i, `set "CODEX_VISION_ENABLED=${visionVal}"`)) batChanged = true;
       } else {
         const content = fs.readFileSync(batPath, "utf8");
-        const target = 'set "CODEX_PROXY_DEBUG=0"';
+        const target = 'set "CODEX_POST_COMPACT_TOOL_OUTPUT_KEEP_RECENT=2"';
         if (content.includes(target)) {
           fs.writeFileSync(batPath, content.replace(target, `${target}\r\nset "CODEX_VISION_ENABLED=${visionVal}"`), "utf8");
           batChanged = true;
@@ -255,11 +254,134 @@ function main() {
   for (const f of modified) {
     console.log(`  + ${f}`);
   }
-  console.log("\nAll thresholds and context parameters are now perfectly aligned.");
+  console.log("\nAll context parameters and thresholds are now cleanly aligned.\n");
+}
+
+function promptInteractive(codexHome, vscodeRoot) {
+  const current = getCurrentConfig(codexHome, vscodeRoot);
+  console.log("========================================================");
+  console.log("    Codex Context & Vision Configuration Manager");
+  console.log("========================================================");
+  console.log("Current Configuration:");
+  console.log(`  - Context Window:      ${(current.contextWindow || 126383).toLocaleString()} tokens (effective: ${Math.floor((current.contextWindow || 126383)*0.95).toLocaleString()})`);
+  console.log(`  - Auto-Compact Limit:  ${(current.autoCompact || 108000).toLocaleString()} tokens`);
+  console.log(`  - Prune Trigger:       ${(current.pruneTokens || 112000).toLocaleString()} tokens`);
+  console.log(`  - Multimodal Vision:   ${current.visionEnabled ? "ENABLED (image_url for Vision models)" : "DISABLED (text replacement for text-only models)"}`);
+  console.log("========================================================");
+  console.log("Select an option:");
+  console.log("  [1] Change Context Size (e.g. 120064, 128k, 64k, 32k)");
+  console.log("  [2] Turn Vision OFF (for text-only models, prevents screenshot errors)");
+  console.log("  [3] Turn Vision ON  (for Qwen-VL & multimodal models)");
+  console.log("  [4] Quick Presets: 120k Qwen-VL (Full)");
+  console.log("  [5] Quick Presets: 64k Text-Only (No Vision)");
+  console.log("  [6] Quick Presets: 32k Fast Text (No Vision)");
+  console.log("  [0] Exit without changes");
+  console.log("--------------------------------------------------------");
+
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout
+  });
+
+  rl.question("Enter choice [0-6]: ", answer => {
+    const choice = answer.trim();
+    if (choice === "1") {
+      rl.question("Enter new context tokens (e.g. 120064, 128k, 64k, 32k): ", ctxStr => {
+        const tokens = parseTokens(ctxStr);
+        if (!tokens) {
+          console.log("Invalid token count entered.");
+          rl.close();
+          return;
+        }
+        applyConfiguration(codexHome, vscodeRoot, tokens, null);
+        rl.close();
+      });
+    } else if (choice === "2") {
+      applyConfiguration(codexHome, vscodeRoot, null, false);
+      rl.close();
+    } else if (choice === "3") {
+      applyConfiguration(codexHome, vscodeRoot, null, true);
+      rl.close();
+    } else if (choice === "4") {
+      applyConfiguration(codexHome, vscodeRoot, 120064, true);
+      rl.close();
+    } else if (choice === "5") {
+      applyConfiguration(codexHome, vscodeRoot, 65536, false);
+      rl.close();
+    } else if (choice === "6") {
+      applyConfiguration(codexHome, vscodeRoot, 32768, false);
+      rl.close();
+    } else {
+      console.log("Exited without changes.");
+      rl.close();
+    }
+  });
+}
+
+function main() {
+  const args = process.argv.slice(2);
+  let requestedTokens = null;
+  let visionToggle = null;
+  let dryRun = false;
+  let showStatus = false;
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i].toLowerCase();
+    if (arg === "--status" || arg === "-s" || arg === "status") {
+      showStatus = true;
+    } else if (arg === "--dry-run") {
+      dryRun = true;
+    } else if (arg === "vision" && args[i + 1]) {
+      const next = args[++i].toLowerCase();
+      if (next === "on" || next === "1" || next === "enable") visionToggle = true;
+      else if (next === "off" || next === "0" || next === "disable") visionToggle = false;
+    } else if (arg === "--vision=on" || arg === "--vision" || arg === "--enable-vision" || arg === "vision-on") {
+      visionToggle = true;
+    } else if (arg === "--vision=off" || arg === "--no-vision" || arg === "--disable-vision" || arg === "vision-off") {
+      visionToggle = false;
+    } else if (!arg.startsWith("-")) {
+      const parsed = parseTokens(arg);
+      if (parsed != null && requestedTokens == null) {
+        requestedTokens = parsed;
+      }
+    }
+  }
+
+  const { codexHome, vscodeRoot } = resolveDirectories();
+  if (!codexHome) {
+    console.error("Error: could not find codex-home directory");
+    process.exit(1);
+  }
+
+  if (showStatus) {
+    const current = getCurrentConfig(codexHome, vscodeRoot);
+    console.log("========================================================");
+    console.log("    Codex Context & Vision Current Status");
+    console.log("========================================================");
+    console.log(`Context Window:      ${(current.contextWindow || 126383).toLocaleString()} tokens (effective: ${Math.floor((current.contextWindow || 126383)*0.95).toLocaleString()})`);
+    console.log(`Auto-Compact Limit:  ${(current.autoCompact || 108000).toLocaleString()} tokens`);
+    console.log(`Prune Trigger:       ${(current.pruneTokens || 112000).toLocaleString()} tokens`);
+    console.log(`Multimodal Vision:   ${current.visionEnabled ? "ENABLED" : "DISABLED"}`);
+    console.log("========================================================");
+    process.exit(0);
+  }
+
+  // Interactive menu if run with no args
+  if (requestedTokens == null && visionToggle == null) {
+    if (process.stdin.isTTY) {
+      promptInteractive(codexHome, vscodeRoot);
+      return;
+    } else {
+      console.log("Usage: node set_context_size.js <tokens> [vision on|off] [--dry-run]");
+      process.exit(0);
+    }
+  }
+
+  applyConfiguration(codexHome, vscodeRoot, requestedTokens, visionToggle, dryRun);
 }
 
 if (require.main === module) {
   main();
 }
 
-module.exports = { calculateContextParameters, parseTokens };
+module.exports = { calculateContextParameters, parseTokens, applyConfiguration };
