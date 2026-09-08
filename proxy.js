@@ -972,6 +972,95 @@ function extractApplyPatchFromShellArgs(args) {
   return extractApplyPatchFromShellCommand(shellCommandText(args));
 }
 
+function bridgeVisionToolOutputs(body) {
+  if (!body || !Array.isArray(body.input)) return;
+  const newInput = [];
+
+  let latestImageIndex = -1;
+  for (let i = body.input.length - 1; i >= 0; i--) {
+    const item = body.input[i];
+    if (item && (item.type === "function_call_output" || item.type === "custom_tool_call_output")) {
+      if (Array.isArray(item.output)) {
+        for (const b of item.output) {
+          if (b && typeof b === "object" && (b.type === "input_image" || b.type === "image_url" || b.image_url)) {
+            latestImageIndex = i;
+            break;
+          }
+        }
+      }
+      if (latestImageIndex !== -1) break;
+    }
+  }
+
+  for (let i = 0; i < body.input.length; i++) {
+    const item = body.input[i];
+    if (item && (item.type === "function_call_output" || item.type === "custom_tool_call_output")) {
+      const out = item.output;
+      const textParts = [];
+      const imageBlocks = [];
+
+      if (Array.isArray(out)) {
+        for (const b of out) {
+          if (!b) continue;
+          if (typeof b === "string") {
+            textParts.push(b);
+          } else if (typeof b === "object") {
+            if (b.type === "input_image" || b.type === "image_url" || b.image_url) {
+              const url = typeof b.image_url === "string" ? b.image_url : (b.image_url?.url || "");
+              if (url) {
+                if (i === latestImageIndex) {
+                  imageBlocks.push({ type: "input_image", image_url: url });
+                } else {
+                  textParts.push("[Previous screenshot image already inspected in history]");
+                }
+              }
+            } else if (typeof b.text === "string") {
+              textParts.push(b.text);
+            } else if (typeof b.content === "string") {
+              textParts.push(b.content);
+            } else {
+              try { textParts.push(JSON.stringify(b)); } catch {}
+            }
+          }
+        }
+      } else if (typeof out === "string") {
+        textParts.push(out);
+      } else if (out && typeof out === "object") {
+        if (typeof out.text === "string") textParts.push(out.text);
+        else if (typeof out.content === "string") textParts.push(out.content);
+        else {
+          try { textParts.push(JSON.stringify(out)); } catch {}
+        }
+      }
+
+      let cleanText = textParts.filter(Boolean).join("\n").trim();
+      if (cleanText.includes("data:image/") && cleanText.includes(";base64,")) {
+        cleanText = cleanText.replace(/data:image\/[a-zA-Z0-9.+_-]+;base64,[A-Za-z0-9+/=]{100,}/g, (m) => `[Image data:image;base64 omitted (${Math.round(m.length / 1024)} KB)]`);
+      }
+      if (!cleanText) cleanText = "Tool executed successfully.";
+
+      const cleanItem = clone(item);
+      cleanItem.type = "function_call_output";
+      cleanItem.output = [{ type: "input_text", text: cleanText }];
+      newInput.push(cleanItem);
+
+      for (const img of imageBlocks) {
+        newInput.push({
+          role: "user",
+          content: [
+            { type: "input_text", text: "[Attached screenshot image from tool]:" },
+            img
+          ]
+        });
+      }
+    } else {
+      newInput.push(item);
+    }
+  }
+
+  body.input = newInput;
+}
+
 function normalizeToolOutputArray(item) {
   if (item && item.type === "function_call_output" && Array.isArray(item.output)) {
     item.output = item.output.map(block => {
@@ -987,15 +1076,28 @@ function normalizeToolOutputArray(item) {
       if (text == null) {
         try { text = JSON.stringify(b); } catch { text = ""; }
       }
+      if (typeof text === "string" && text.includes("data:image/") && text.includes(";base64,")) {
+        text = text.replace(/data:image\/[a-zA-Z0-9.+_-]+;base64,[A-Za-z0-9+/=]{100,}/g, (m) => `[Image data:image;base64 omitted (${Math.round(m.length / 1024)} KB)]`);
+      }
       return { type: "input_text", text };
     });
   } else if (item && item.type === "function_call_output" && typeof item.output === "string") {
-    item.output = [{ type: "input_text", text: item.output }];
+    let text = item.output;
+    if (text.includes("data:image/") && text.includes(";base64,")) {
+      text = text.replace(/data:image\/[a-zA-Z0-9.+_-]+;base64,[A-Za-z0-9+/=]{100,}/g, (m) => `[Image data:image;base64 omitted (${Math.round(m.length / 1024)} KB)]`);
+    }
+    item.output = [{ type: "input_text", text }];
   } else if (item && item.type === "function_call_output" && item.output && typeof item.output === "object") {
     let text = typeof item.output.text === "string" ? item.output.text : null;
     if (text == null && typeof item.output.content === "string") text = item.output.content;
+    if (text == null && (item.output.type === "image_url" || item.output.type === "input_image" || item.output.image_url)) {
+      text = `[Image attached: ${item.output.type || "image"}]`;
+    }
     if (text == null) {
       try { text = JSON.stringify(item.output); } catch { text = ""; }
+    }
+    if (typeof text === "string" && text.includes("data:image/") && text.includes(";base64,")) {
+      text = text.replace(/data:image\/[a-zA-Z0-9.+_-]+;base64,[A-Za-z0-9+/=]{100,}/g, (m) => `[Image data:image;base64 omitted (${Math.round(m.length / 1024)} KB)]`);
     }
     item.output = [{ type: "input_text", text }];
   }
@@ -1013,6 +1115,10 @@ function messageContentText(content) {
         continue;
       }
       if (!block || typeof block !== "object") continue;
+      if (block.type === "input_image" || block.type === "image_url" || block.image_url) {
+        parts.push(`[Image attached: ${block.type || "image"}]`);
+        continue;
+      }
       if (typeof block.text === "string") {
         parts.push(block.text);
         continue;
@@ -1523,7 +1629,24 @@ function prunePostCompactionToolOutputs(body, maxChars = POST_COMPACT_TOOL_OUTPU
   for (let index = 0; index < body.input.length; index++) {
     const item = body.input[index];
     if (!item || !["function_call_output", "custom_tool_call_output"].includes(item.type)) continue;
-    if (Array.isArray(item.output)) item.output = item.output.map(block => typeof block === "string" ? block : block?.text || JSON.stringify(block)).join("\n");
+    if (Array.isArray(item.output)) {
+      item.output = item.output.map(block => {
+        if (!block) return "";
+        if (typeof block === "string") return block;
+        if (typeof block === "object") {
+          if (block.type === "input_image" || block.type === "image_url" || block.image_url) {
+            return `[Image attached: ${block.type || "image"}]`;
+          }
+          if (typeof block.text === "string") return block.text;
+          if (typeof block.content === "string") return block.content;
+          try { return JSON.stringify(block); } catch { return ""; }
+        }
+        return String(block);
+      }).join("\n");
+    }
+    if (typeof item.output === "string" && item.output.includes("data:image/") && item.output.includes(";base64,")) {
+      item.output = item.output.replace(/data:image\/[a-zA-Z0-9.+_-]+;base64,[A-Za-z0-9+/=]{100,}/g, (m) => `[Image data:image;base64 omitted (${Math.round(m.length / 1024)} KB)]`);
+    }
     if (typeof item.output !== "string") continue;
     outputs.push({ index, chars: item.output.length, source: sourceCall(index) });
   }
@@ -1536,6 +1659,16 @@ function prunePostCompactionToolOutputs(body, maxChars = POST_COMPACT_TOOL_OUTPU
   for (const entry of [...outputs].reverse()) {
     const item = body.input[entry.index];
     if (protectedIndexes.has(entry.index)) {
+      const maxRecentChars = Math.max(effectiveMaxChars * 4, 24000);
+      if (item.output.length > maxRecentChars) {
+        const digest = crypto.createHash("sha256").update(item.output).digest("hex").slice(0, 16);
+        const marker = `\n...[RECENT TOOL OUTPUT OVERSIZED TRUNCATED sha256=${digest} original_chars=${item.output.length}]...\n`;
+        const available = Math.max(0, maxRecentChars - marker.length);
+        const head = Math.floor(available * 0.75);
+        const tail = available - head > 0 ? item.output.slice(-(available - head)) : "";
+        item.output = item.output.slice(0, head) + marker + tail;
+        truncated++;
+      }
       afterChars += item.output.length;
       continue;
     }
@@ -1877,6 +2010,7 @@ function prepareRequest(original) {
   const preCompactionHistory = prunePreCompactionHistory(body);
   if (preCompactionHistory.removed) diag(`POST_COMPACT history_pruned removed_items=${preCompactionHistory.removed}`);
   const postCompactPruning = prunePostCompactionUserHistory(body);
+  bridgeVisionToolOutputs(body);
   const postCompactToolPruning = prunePostCompactionToolOutputs(body);
   pruneOrphanProgressMessages(body);
   rewriteTools(body, maps);
@@ -4301,6 +4435,28 @@ function selftest() {
     injectMemoryIntoInput({ input: testInput }, "Past fix details");
     if (!testInput[0].content.includes("Past fix details") || !testInput[0].content.includes("EPISODIC KNOWLEDGE")) {
       throw new Error("injectMemoryIntoInput failed");
+    }
+
+    const visionTestReq = {
+      model: "llm",
+      input: [
+        { role: "user", content: "Take screenshot" },
+        { type: "function_call", call_id: "c1", name: "take_screenshot", arguments: "{}" },
+        {
+          type: "function_call_output",
+          call_id: "c1",
+          output: [
+            { type: "input_text", text: "Screenshot: 960x540\nSaved to: screen.png" },
+            { type: "input_image", image_url: "data:image/png;base64," + "A".repeat(50000) }
+          ]
+        }
+      ]
+    };
+    const visionPrepared = prepareRequest(visionTestReq);
+    const visionFco = visionPrepared.body.input.find(x => x.type === "function_call_output");
+    const visionUserImg = visionPrepared.body.input.find(x => x.role === "user" && Array.isArray(x.content) && x.content.some(c => c.type === "input_image"));
+    if (!visionUserImg || JSON.stringify(visionFco.output).includes("A".repeat(100))) {
+      throw new Error("vision bridge or base64 extraction failed");
     }
   } finally {
     memoryStore.close();
