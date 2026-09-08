@@ -796,6 +796,72 @@ function normalizeApplyPatchInput(input) {
     .replace(/^[ \t]*\*{3}[ \t]*end[ \t]+patch[ \t]*$/gim, "*** End Patch");
 }
 
+const base64Store = new Map();
+
+function storeBase64(blob) {
+  const hash = crypto.createHash("sha256").update(blob).digest("hex").slice(0, 16);
+  if (base64Store.size > 1000) {
+    const first = base64Store.keys().next().value;
+    base64Store.delete(first);
+  }
+  base64Store.set(hash, blob);
+  return hash;
+}
+
+function foldLargeBase64Text(text) {
+  if (typeof text !== "string" || text.length < 512) return text;
+
+  // 1. Data URIs of any MIME type (>= 256 chars base64)
+  let folded = text.replace(/data:([a-zA-Z0-9.+_-]+\/[a-zA-Z0-9.+_-]+);base64,([A-Za-z0-9+/=\s]{256,})/g, (match, mime, payload) => {
+    const rawPayload = payload.replace(/\s+/g, "");
+    if (rawPayload.length < 256) return match;
+    const hash = storeBase64(rawPayload);
+    const sizeKb = Math.round(rawPayload.length / 1024);
+    const head = rawPayload.slice(0, 24);
+    const tail = rawPayload.slice(-12);
+    return `data:${mime};base64,${head}...[BASE64_DATA_OMITTED: size=${sizeKb}KB, sha256=${hash}, hint: binary asset inlined on disk; keep intact or use scripts]...${tail}`;
+  });
+
+  // 2. Raw long base64 strings (>= 512 chars)
+  folded = folded.replace(/(['"`:=,\s\[\(\n\r])([A-Za-z0-9+/]{512,}={0,2})(['"`:;,\s\]\)\n\r])/g, (match, p1, blob, p2) => {
+    if (blob.includes("BASE64_DATA_OMITTED") || blob.includes("BASE64_BLOB_OMITTED")) return match;
+    const hash = storeBase64(blob);
+    const sizeKb = Math.round(blob.length / 1024);
+    const head = blob.slice(0, 24);
+    const tail = blob.slice(-12);
+    return `${p1}${head}...[BASE64_BLOB_OMITTED: size=${sizeKb}KB, sha256=${hash}, hint: binary asset inlined on disk; keep intact or use scripts]...${tail}${p2}`;
+  });
+
+  return folded;
+}
+
+function rehydrateBase64(text) {
+  if (typeof text !== "string") return text;
+  if (!text.includes("BASE64_DATA_OMITTED") && !text.includes("BASE64_BLOB_OMITTED")) return text;
+
+  // Case 1: Rehydrate data URI marker
+  let rehydrated = text.replace(/data:([a-zA-Z0-9.+_-]+\/[a-zA-Z0-9.+_-]+);base64,[A-Za-z0-9+/=]*\s*\.\.\.\[BASE64_DATA_OMITTED:[^\]]*sha256=([a-f0-9]{16})[^\]]*\]\.\.\.\s*[A-Za-z0-9+/=]*/g, (match, mime, hash) => {
+    const original = base64Store.get(hash);
+    if (original) {
+      diag(`BASE64_REHYDRATE restored data URI sha256=${hash} bytes=${original.length}`);
+      return `data:${mime};base64,${original}`;
+    }
+    return match;
+  });
+
+  // Case 2: Rehydrate raw base64 blob marker
+  rehydrated = rehydrated.replace(/[A-Za-z0-9+/=]*\s*\.\.\.\[BASE64_BLOB_OMITTED:[^\]]*sha256=([a-f0-9]{16})[^\]]*\]\.\.\.\s*[A-Za-z0-9+/=]*/g, (match, hash) => {
+    const original = base64Store.get(hash);
+    if (original) {
+      diag(`BASE64_REHYDRATE restored raw blob sha256=${hash} bytes=${original.length}`);
+      return original;
+    }
+    return match;
+  });
+
+  return rehydrated;
+}
+
 function decodeCustomArgs(name, args) {
   const key = customArgKey(name);
   if (typeof args !== "string") return "";
@@ -808,7 +874,7 @@ function decodeCustomArgs(name, args) {
   } catch {}
   const normalized = name === "apply_patch" ? normalizeApplyPatchInput(decoded) : decoded;
   if (normalized !== decoded) diag("EDIT normalized apply_patch protocol headers");
-  return normalized;
+  return rehydrateBase64(normalized);
 }
 
 function shellCommandText(args) {
@@ -1034,9 +1100,7 @@ function bridgeVisionToolOutputs(body) {
       }
 
       let cleanText = textParts.filter(Boolean).join("\n").trim();
-      if (cleanText.includes("data:image/") && cleanText.includes(";base64,")) {
-        cleanText = cleanText.replace(/data:image\/[a-zA-Z0-9.+_-]+;base64,[A-Za-z0-9+/=]{100,}/g, (m) => `[Image data:image;base64 omitted (${Math.round(m.length / 1024)} KB)]`);
-      }
+      cleanText = foldLargeBase64Text(cleanText);
       if (!cleanText) cleanText = "Tool executed successfully.";
 
       const cleanItem = clone(item);
@@ -1065,7 +1129,7 @@ function normalizeToolOutputArray(item) {
   if (item && item.type === "function_call_output" && Array.isArray(item.output)) {
     item.output = item.output.map(block => {
       if (!block || typeof block !== "object") {
-        return { type: "input_text", text: String(block ?? "") };
+        return { type: "input_text", text: foldLargeBase64Text(String(block ?? "")) };
       }
       const b = clone(block);
       let text = typeof b.text === "string" ? b.text : null;
@@ -1076,16 +1140,11 @@ function normalizeToolOutputArray(item) {
       if (text == null) {
         try { text = JSON.stringify(b); } catch { text = ""; }
       }
-      if (typeof text === "string" && text.includes("data:image/") && text.includes(";base64,")) {
-        text = text.replace(/data:image\/[a-zA-Z0-9.+_-]+;base64,[A-Za-z0-9+/=]{100,}/g, (m) => `[Image data:image;base64 omitted (${Math.round(m.length / 1024)} KB)]`);
-      }
+      text = foldLargeBase64Text(text);
       return { type: "input_text", text };
     });
   } else if (item && item.type === "function_call_output" && typeof item.output === "string") {
-    let text = item.output;
-    if (text.includes("data:image/") && text.includes(";base64,")) {
-      text = text.replace(/data:image\/[a-zA-Z0-9.+_-]+;base64,[A-Za-z0-9+/=]{100,}/g, (m) => `[Image data:image;base64 omitted (${Math.round(m.length / 1024)} KB)]`);
-    }
+    let text = foldLargeBase64Text(item.output);
     item.output = [{ type: "input_text", text }];
   } else if (item && item.type === "function_call_output" && item.output && typeof item.output === "object") {
     let text = typeof item.output.text === "string" ? item.output.text : null;
@@ -1096,9 +1155,7 @@ function normalizeToolOutputArray(item) {
     if (text == null) {
       try { text = JSON.stringify(item.output); } catch { text = ""; }
     }
-    if (typeof text === "string" && text.includes("data:image/") && text.includes(";base64,")) {
-      text = text.replace(/data:image\/[a-zA-Z0-9.+_-]+;base64,[A-Za-z0-9+/=]{100,}/g, (m) => `[Image data:image;base64 omitted (${Math.round(m.length / 1024)} KB)]`);
-    }
+    text = foldLargeBase64Text(text);
     item.output = [{ type: "input_text", text }];
   }
 }
@@ -1644,8 +1701,8 @@ function prunePostCompactionToolOutputs(body, maxChars = POST_COMPACT_TOOL_OUTPU
         return String(block);
       }).join("\n");
     }
-    if (typeof item.output === "string" && item.output.includes("data:image/") && item.output.includes(";base64,")) {
-      item.output = item.output.replace(/data:image\/[a-zA-Z0-9.+_-]+;base64,[A-Za-z0-9+/=]{100,}/g, (m) => `[Image data:image;base64 omitted (${Math.round(m.length / 1024)} KB)]`);
+    if (typeof item.output === "string") {
+      item.output = foldLargeBase64Text(item.output);
     }
     if (typeof item.output !== "string") continue;
     outputs.push({ index, chars: item.output.length, source: sourceCall(index) });
@@ -1742,6 +1799,7 @@ function appendCapabilityGuidance(body) {
 - PATH baseline detected at proxy startup: ${available}.
 - Before creating a helper script or downloading software for search, reading, inspection, conversion, or diagnostics, check existing software with Get-Command/where.exe on Windows or command -v on Unix.
 - SOURCE DISCOVERY GATE: when a code graph MCP namespace is attached and the request concerns source-code definitions, implementations, callers, dependencies, architecture, or locating a code symbol, the first discovery call MUST be a matching graph MCP tool (search_graph, trace_path, get_code_snippet, query_graph, or get_architecture). Do not use rg, Get-Content, cat, or an ad-hoc reader before that graph call. Use rg -n, rg --files, or native file reading only for exact literals, non-code files, or after the graph call returned no sufficient result; state that fallback reason briefly. After compaction, trust the checkpoint's completed work and use the graph first for only the missing symbol or range instead of reopening whole source files. Never claim graph MCP is unavailable without attempting its attached callable tool. Do not create ad-hoc grep/read helper scripts.
+- INLINED BINARY ASSETS / BASE64: Files or tool outputs may contain inlined binary assets folded as [BASE64_DATA_OMITTED: ... hint: binary asset inlined on disk; keep intact or use scripts]. Never attempt to generate or modify massive base64 strings by hand. To edit around inlined assets, use standard patches. If you need to update or replace an asset, extract it to a separate file (e.g. in assets/) or use a script.
 - Full access permits task-scoped discovery and installation, but does not imply that every installed GUI program is pre-enumerated. Discover additional software only when the task needs it.`;
   body.instructions = instructions ? `${instructions}\n\n${rule}` : rule;
   return true;
@@ -2076,6 +2134,15 @@ function convertFunctionItem(item, maps) {
     const out = clone(item);
     out.name = ns.name;
     out.namespace = ns.namespace;
+    if (typeof out.arguments === "string" && (out.arguments.includes("BASE64_DATA_OMITTED") || out.arguments.includes("BASE64_BLOB_OMITTED"))) {
+      out.arguments = rehydrateBase64(out.arguments);
+    }
+    return out;
+  }
+
+  if (typeof item.arguments === "string" && (item.arguments.includes("BASE64_DATA_OMITTED") || item.arguments.includes("BASE64_BLOB_OMITTED"))) {
+    const out = clone(item);
+    out.arguments = rehydrateBase64(out.arguments);
     return out;
   }
 
@@ -2092,6 +2159,10 @@ function rewriteResponseObject(obj, maps) {
     return;
   }
   if (!obj || typeof obj !== "object") return;
+
+  if (typeof obj.arguments === "string" && (obj.arguments.includes("BASE64_DATA_OMITTED") || obj.arguments.includes("BASE64_BLOB_OMITTED"))) {
+    obj.arguments = rehydrateBase64(obj.arguments);
+  }
 
   if (Array.isArray(obj.output)) {
     obj.output = obj.output.map(x => convertFunctionItem(x, maps));
@@ -4457,6 +4528,22 @@ function selftest() {
     const visionUserImg = visionPrepared.body.input.find(x => x.role === "user" && Array.isArray(x.content) && x.content.some(c => c.type === "input_image"));
     if (!visionUserImg || JSON.stringify(visionFco.output).includes("A".repeat(100))) {
       throw new Error("vision bridge or base64 extraction failed");
+    }
+
+    const testRawB64 = "iVBORw0KGgoAAA" + "X".repeat(5000) + "ErkJggg==";
+    const testFileWithB64 = `const icon = "data:image/png;base64,${testRawB64}";\nconsole.log(1);`;
+    const testFolded = foldLargeBase64Text(testFileWithB64);
+    if (!testFolded.includes("BASE64_DATA_OMITTED") || testFolded.length > 300) {
+      throw new Error("foldLargeBase64Text failed to collapse large base64");
+    }
+    const testRehydrated = rehydrateBase64(testFolded);
+    if (testRehydrated !== testFileWithB64) {
+      throw new Error("rehydrateBase64 failed to reconstruct exact original");
+    }
+    const testPatch = `--- a/file.js\n+++ b/file.js\n@@ -1,2 +1,2 @@\n-${testFolded.split("\n")[0]}\n+const icon = null;\n console.log(1);`;
+    const rehydratedPatch = decodeCustomArgs("apply_patch", JSON.stringify({ patch: testPatch }));
+    if (!rehydratedPatch.includes(testRawB64)) {
+      throw new Error("decodeCustomArgs apply_patch rehydration failed");
     }
   } finally {
     memoryStore.close();
