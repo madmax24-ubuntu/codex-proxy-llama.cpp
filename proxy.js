@@ -48,6 +48,7 @@ const POST_COMPACT_SOURCE_OUTPUT_MAX_CHARS = Math.max(0, Number(process.env.CODE
 const POST_COMPACT_SOURCE_TOTAL_CHARS = Math.max(0, Number(process.env.CODEX_POST_COMPACT_SOURCE_TOTAL_CHARS ?? "60000") || 0);
 const POST_COMPACT_PRUNE_TRIGGER_TOKENS = Math.max(1000, Number(process.env.CODEX_POST_COMPACT_PRUNE_TRIGGER_TOKENS || "112000") || 112000);
 const POST_COMPACT_TOOL_OUTPUT_KEEP_RECENT = Math.max(1, Math.min(8, Number(process.env.CODEX_POST_COMPACT_TOOL_OUTPUT_KEEP_RECENT || "2") || 2));
+const ENABLE_POST_COMPACT_TOOL_PRUNE = /^(1|true|yes)$/i.test(process.env.CODEX_ENABLE_POST_COMPACT_TOOL_PRUNE || "0");
 const COMPACT_MAX_OUTPUT_TOKENS = Math.max(1024, Number(process.env.CODEX_COMPACT_MAX_OUTPUT_TOKENS || "4096") || 4096);
 const COMPACT_REASONING_EFFORT = String(process.env.CODEX_COMPACT_REASONING_EFFORT || "low").toLowerCase();
 const COMPACT_REASONING_BUDGET = Math.max(0, Number(process.env.CODEX_COMPACT_REASONING_BUDGET || "0") || 0);
@@ -1731,6 +1732,9 @@ function prunePostCompactionToolOutputs(body, maxChars = POST_COMPACT_TOOL_OUTPU
     }
     if (typeof item.output !== "string") continue;
     outputs.push({ index, chars: item.output.length, source: sourceCall(index) });
+  }
+  if (!ENABLE_POST_COMPACT_TOOL_PRUNE && !SELFTEST_MODE) {
+    return { foundSummary: true, truncated: 0, beforeChars: 0, afterChars: 0, estimatedTokens, deferred: true, retainedSourceChars: 0, retainedToolChars: 0 };
   }
   const protectedIndexes = new Set(outputs.slice(-keepRecent).map(item => item.index));
   const totalLimit = effectiveMaxChars * 8;
