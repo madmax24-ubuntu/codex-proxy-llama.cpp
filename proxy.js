@@ -2112,11 +2112,16 @@ function convertFunctionItem(item, maps) {
   }
 
   const custom = maps.customByName.get(item.name);
+  const callId = item.call_id || item.id || null;
+  const rawId = item.id || item.call_id || null;
+  const isStandardFcPair = rawId && String(rawId).startsWith("fc_") && callId && String(callId).startsWith("call_");
+  const canonicalId = isStandardFcPair ? callId : rawId;
+
   if (custom) {
     if (custom.name === "apply_patch") diag("EDIT apply_patch via dedicated native tool");
     return {
-      id: item.id || item.call_id || null,
-      call_id: item.call_id || item.id || null,
+      id: canonicalId || callId || null,
+      call_id: callId || canonicalId || null,
       name: custom.name,
       type: "custom_tool_call",
       input: decodeCustomArgs(custom.name, item.arguments)
@@ -2798,8 +2803,9 @@ class SseTranslator {
         const name = st.name;
         const args = typeof evt.item.arguments === "string" ? evt.item.arguments : st.args;
         const input = decodeCustomArgs(name, args);
-        const itemId = evt.item.id || evt.item.call_id || id;
-        const callId = evt.item.call_id || evt.item.id || id;
+        const callId = evt.item.call_id || st.call_id || id;
+        const isStandardFcPair = (evt.item.id && String(evt.item.id).startsWith("fc_")) || (id && String(id).startsWith("fc_"));
+        const itemId = (isStandardFcPair && callId && String(callId).startsWith("call_")) ? callId : (evt.item.id || evt.item.call_id || id);
         const oi = finiteInt(evt.output_index) ?? st.output_index ?? 0;
         const customItem = {
           id: itemId,
@@ -2809,6 +2815,8 @@ class SseTranslator {
           input
         };
         this.customItems.delete(id);
+        if (evt.item?.id) this.customItems.delete(evt.item.id);
+        if (evt.item?.call_id) this.customItems.delete(evt.item.call_id);
         if (name === "apply_patch") diag("EDIT apply_patch via dedicated native tool (stream)");
 
         return [
