@@ -234,6 +234,23 @@ Inspect or remove entries:
 node proxy.js --memory-list
 node proxy.js --memory-list /path/to/project
 node proxy.js --memory-forget MEMORY_ID
+## Automated Context & Vision Configuration
+
+Use `set_context_size.js` to automatically calculate and synchronize all thresholds across `config.toml`, `model_catalog.json`, `prepare_config.js`, and `.bat`:
+
+```bash
+# Set context size to 120,064 tokens (auto-calculates compact & prune limits)
+node set_context_size.js 120064
+
+# Set context with shorthand notation
+node set_context_size.js 128k
+node set_context_size.js 64k
+
+# Disable vision for non-multimodal text models (prevents 400 Bad Request on screenshots)
+node set_context_size.js 64k --vision=off
+
+# View current configuration and calculated thresholds
+node set_context_size.js --status
 ```
 
 ## Environment variables
@@ -246,6 +263,7 @@ node proxy.js --memory-forget MEMORY_ID
 | `CODEX_PROXY_HOST` | Proxy listen address | `127.0.0.1` |
 | `CODEX_PROXY_PORT` | Proxy listen port | `8181` |
 | `CODEX_THINKING_MODE` | `auto`, `qwen`, `generic`, `on`, or `off` | `auto` |
+| `CODEX_VISION_ENABLED` | Enable multimodal vision bridge (`0` gracefully replaces images with text for text-only models) | `1` |
 | `CODEX_REASONING_LEVELS` | Comma-separated supported levels | `low,medium,high` |
 | `CODEX_FORCE_SERIAL_TOOL_CALLS` | Force serial tool calls | `1` |
 | `CODEX_UPSTREAM_RETRY_ATTEMPTS` | Reconnect attempts before an uncommitted response fails | `30` |
@@ -260,7 +278,7 @@ node proxy.js --memory-forget MEMORY_ID
 | `CODEX_POST_COMPACT_TOOL_OUTPUT_MAX_CHARS` | Maximum retained characters in each older tool output after compaction | `4000` |
 | `CODEX_POST_COMPACT_SOURCE_OUTPUT_MAX_CHARS` | Maximum retained characters for source-code and graph outputs after compaction | `12000` |
 | `CODEX_POST_COMPACT_SOURCE_TOTAL_CHARS` | Newest-first budget reserved separately for source-code and graph outputs after compaction | `60000` |
-| `CODEX_POST_COMPACT_PRUNE_TRIGGER_TOKENS` | Estimated token threshold before emergency post-compaction history pruning activates (protects KV-cache) | `116000` |
+| `CODEX_POST_COMPACT_PRUNE_TRIGGER_TOKENS` | Estimated token threshold before emergency post-compaction history pruning activates (protects KV-cache) | `112000` |
 | `CODEX_POST_COMPACT_TOOL_OUTPUT_KEEP_RECENT` | Recent tool outputs kept in full after compaction | `2` |
 | `CODEX_FORWARD_TOOL_PROGRESS` | Forward concise assistant updates before tool calls | `1` |
 | `CODEX_PROGRESS_MAX_CHARS` | Maximum length of a forwarded tool-progress update | `1200` |
