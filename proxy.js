@@ -73,7 +73,6 @@ const MEMORY_MAX_ITEMS = Math.max(1, Math.min(4, Number(process.env.CODEX_MEMORY
 const MEMORY_MAX_CHARS = Math.max(200, Math.min(2000, Number(process.env.CODEX_MEMORY_MAX_CHARS || "500") || 500));
 const MEMORY_ENABLED = !/^(0|false|no)$/i.test(process.env.CODEX_MEMORY_ENABLED || "1");
 const MEMORY_BACKEND = String(process.env.CODEX_MEMORY_BACKEND || "json").toLowerCase();
-const VISION_ENABLED = !/^(0|false|no|off)$/i.test(process.env.CODEX_VISION_ENABLED || "1");
 const CHECKPOINT_BY_KEY = new Map();
 const CHECKPOINT_BY_SUMMARY = new Map();
 const MEMORY_INJECTED_TASKS = new Map();
@@ -1042,30 +1041,6 @@ function extractApplyPatchFromShellArgs(args) {
 
 function bridgeVisionToolOutputs(body) {
   if (!body || !Array.isArray(body.input)) return;
-  if (!VISION_ENABLED) {
-    for (const item of body.input) {
-      if (!item) continue;
-      if (Array.isArray(item.content)) {
-        item.content = item.content.map(b => {
-          if (b && typeof b === "object" && (b.type === "input_image" || b.type === "image_url" || b.image_url)) {
-            return { type: "input_text", text: "[Image omitted: vision disabled for this model]" };
-          }
-          return b;
-        });
-      }
-      if (item.type === "function_call_output" || item.type === "custom_tool_call_output") {
-        if (Array.isArray(item.output)) {
-          item.output = item.output.map(b => {
-            if (b && typeof b === "object" && (b.type === "input_image" || b.type === "image_url" || b.image_url)) {
-              return { type: "input_text", text: "[Image output omitted: vision disabled for this model]" };
-            }
-            return b;
-          });
-        }
-      }
-    }
-    return;
-  }
   const newInput = [];
 
   let latestImageIndex = -1;
