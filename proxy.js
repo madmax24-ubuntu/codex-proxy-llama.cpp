@@ -2034,6 +2034,49 @@ function normalizeReasoningEffort(body) {
   return { raw, effective, mapped, budget };
 }
 
+const RESUME_CONTINUATION_DIRECTIVE = "Продолжай работу над задачей в автономном режиме. Не останавливайся на описании текущего состояния и сразу вызывай инструмент для следующего шага.";
+
+function ensureResumeContinuationDirective(body) {
+  if (!body || !Array.isArray(body.input) || !body.input.length) return false;
+  if (isCompactionRequest(body)) return false;
+
+  const lastIndex = body.input.length - 1;
+  const lastItem = body.input[lastIndex];
+  if (!lastItem || typeof lastItem !== "object") return false;
+
+  if (isUserMessageItem(lastItem)) {
+    const text = messageContentText(lastItem.content).trim();
+    if (!text) {
+      if (typeof lastItem.content === "string") {
+        lastItem.content = RESUME_CONTINUATION_DIRECTIVE;
+      } else if (Array.isArray(lastItem.content)) {
+        const textPart = lastItem.content.find(x => x && typeof x === "object" && typeof x.text === "string");
+        if (textPart) {
+          textPart.text = RESUME_CONTINUATION_DIRECTIVE;
+        } else {
+          lastItem.content = [{ type: "input_text", text: RESUME_CONTINUATION_DIRECTIVE }];
+        }
+      } else {
+        lastItem.content = RESUME_CONTINUATION_DIRECTIVE;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  const isAssistant = lastItem.role === "assistant" || (lastItem.type === "message" && lastItem.role === "assistant");
+  if (isAssistant) {
+    body.input.push({
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: RESUME_CONTINUATION_DIRECTIVE }]
+    });
+    return true;
+  }
+
+  return false;
+}
+
 function prepareRequest(original) {
   const body = clone(original);
   const maps = toolMaps();
@@ -2077,6 +2120,8 @@ function prepareRequest(original) {
   pruneOrphanProgressMessages(body);
   rewriteTools(body, maps);
   appendCapabilityGuidance(body);
+  const resumeContinuation = ensureResumeContinuationDirective(body);
+  if (resumeContinuation) diag("RESUME_CONTINUATION injected directive (tail)");
   // Autonomy protocol is maintained cleanly in instructions without polluting input history turns.
 
   const historyRepairs = rewriteHistoryNode(body.input, maps);
@@ -2211,6 +2256,12 @@ function looksLikeProgressOnly(text) {
   const t = String(text || "").trim();
   if (!t || t.length > 600) return false;
   return /^(?:понял|сейчас|начну|приступаю|давай|проверю|проанализирую|исправлю|оптимизация|теперь|далее|следующим|шаг\s+\d|i['’]ll|i\s+will|let\s+me|now\s+i\s+will|i\s+understand|optimization|next|step\s+\d)\b/i.test(t);
+}
+
+function looksLikeInterruptedOrWaitingForInput(text) {
+  const t = String(text || "").trim();
+  if (!t || t.length > 600) return false;
+  return /(?:вот\s+на\s+ч[её]м\s+я\s+остановил|я\s+остановил(?:ась|ся)|на\s+этом\s+я\s+остановил|что\s+дела(?:ть|ем)\s+дальше|как\s+(?:мне\s+)?продолжи(?:ть|м)|жду\s+(?:дальнейших\s+)?указаний|i['’]?m\s+waiting\s+for|what\s+should\s+(?:i|we)\s+do\s+next|how\s+should\s+we\s+proceed|this\s+is\s+where\s+i\s+stopped)/i.test(t);
 }
 
 function looksLikeTaskCompletion(text) {
@@ -2892,8 +2943,8 @@ class SseTranslator {
         const metrics = compactionTextMetrics(this.text);
         diag(`COMPACTION_SUMMARY accepted chars=${this.text.length} headings=${metrics.present} output_limit_hit=${Number((usage?.output_tokens || 0) >= COMPACT_MAX_OUTPUT_TOKENS)}`);
         updateCheckpointSummary(this.requestMeta.checkpointPath, this.text, usage);
-      } else if (!this.sawToolCall && (hasMalformedToolMarkup(this.text) || looksLikeProgressOnly(this.text) || hasExplicitRemainingWork(this.text) || !this.text.trim()) && this.allowAutoContinue && this.continuationDepth < 2) {
-        const reason = hasMalformedToolMarkup(this.text) ? "malformed-tool-markup" : !this.text.trim() ? "empty-response" : hasExplicitRemainingWork(this.text) ? "explicit-remaining-work" : "progress-only-no-tool";
+      } else if (!this.sawToolCall && (hasMalformedToolMarkup(this.text) || looksLikeProgressOnly(this.text) || looksLikeInterruptedOrWaitingForInput(this.text) || hasExplicitRemainingWork(this.text) || !this.text.trim()) && this.allowAutoContinue && this.continuationDepth < 2) {
+        const reason = hasMalformedToolMarkup(this.text) ? "malformed-tool-markup" : !this.text.trim() ? "empty-response" : looksLikeInterruptedOrWaitingForInput(this.text) ? "interrupted-waiting-for-input" : hasExplicitRemainingWork(this.text) ? "explicit-remaining-work" : "progress-only-no-tool";
         diag(`TURN_GUARD AUTO_CONTINUE depth=${this.continuationDepth} reason=${reason} text=${JSON.stringify(this.text.slice(0, 200))}`);
         this.needsContinuation = true;
         this.continuationReason = reason;
@@ -3224,6 +3275,8 @@ function createServer() {
                     role: "user",
                     content: [{ type: "input_text", text: malformedToolMarkup
                       ? "[SYSTEM: The previous generation ended in malformed tool markup and was discarded. The active user task is NOT complete. Ignore that corrupted output and immediately invoke the appropriate tool to continue the existing task. Do not answer with text.]"
+                      : tr.continuationReason === "interrupted-waiting-for-input"
+                      ? "[SYSTEM: Do NOT stop or ask what to do next. Your task is NOT complete. You MUST immediately invoke the appropriate tool now to continue autonomous execution.]"
                       : tr.text.trim()
                       ? "[SYSTEM: You sent a text message but no tool call. Your task is NOT complete. You MUST immediately invoke the appropriate tool now — do not explain, just call the tool.]"
                       : "[SYSTEM: Empty response detected. Your task is NOT complete. You MUST immediately invoke a tool to continue. Do not write text — call the tool now.]"
@@ -4428,6 +4481,24 @@ function selftest() {
 
   if (!looksLikeProgressOnly("I'll check the files first and then continue.")) {
     throw new Error("progress-only terminal detector failed");
+  }
+
+  if (!looksLikeInterruptedOrWaitingForInput("Вот на чём я остановилась. Что делаем дальше?") ||
+      !looksLikeInterruptedOrWaitingForInput("Я остановилась на этом шаге. Подскажите, как продолжить?") ||
+      !looksLikeInterruptedOrWaitingForInput("This is where I stopped. What should we do next?")) {
+    throw new Error("interrupted/waiting-for-input detector failed");
+  }
+
+  const emptyResumeReq = { model: "llm", input: [{ role: "user", content: " " }] };
+  const emptyResumePrepared = prepareRequest(emptyResumeReq);
+  if (!messageContentText(emptyResumePrepared.body.input[0].content).includes("Продолжай работу над задачей")) {
+    throw new Error("empty resume user message injection failed");
+  }
+
+  const assistantTailReq = { model: "llm", input: [{ role: "user", content: "Do work" }, { role: "assistant", content: "Working..." }] };
+  const assistantTailPrepared = prepareRequest(assistantTailReq);
+  if (assistantTailPrepared.body.input.length !== 3 || !messageContentText(assistantTailPrepared.body.input[2].content).includes("Продолжай работу над задачей")) {
+    throw new Error("assistant tail resume injection failed");
   }
 
   const repeatedInput = [{ role: "user", content: "Create the image" }];
