@@ -48,7 +48,7 @@ const POST_COMPACT_SOURCE_OUTPUT_MAX_CHARS = Math.max(0, Number(process.env.CODE
 const POST_COMPACT_SOURCE_TOTAL_CHARS = Math.max(0, Number(process.env.CODEX_POST_COMPACT_SOURCE_TOTAL_CHARS ?? "60000") || 0);
 const POST_COMPACT_PRUNE_TRIGGER_TOKENS = Math.max(1000, Number(process.env.CODEX_POST_COMPACT_PRUNE_TRIGGER_TOKENS || "112000") || 112000);
 const POST_COMPACT_TOOL_OUTPUT_KEEP_RECENT = Math.max(1, Math.min(8, Number(process.env.CODEX_POST_COMPACT_TOOL_OUTPUT_KEEP_RECENT || "2") || 2));
-const ENABLE_POST_COMPACT_TOOL_PRUNE = /^(1|true|yes)$/i.test(process.env.CODEX_ENABLE_POST_COMPACT_TOOL_PRUNE || "0");
+const ENABLE_POST_COMPACT_TOOL_PRUNE = !/^(0|false|no)$/i.test(process.env.CODEX_ENABLE_POST_COMPACT_TOOL_PRUNE || "0");
 const COMPACT_MAX_OUTPUT_TOKENS = Math.max(1024, Number(process.env.CODEX_COMPACT_MAX_OUTPUT_TOKENS || "4096") || 4096);
 const COMPACT_REASONING_EFFORT = String(process.env.CODEX_COMPACT_REASONING_EFFORT || "low").toLowerCase();
 const COMPACT_REASONING_BUDGET = Math.max(0, Number(process.env.CODEX_COMPACT_REASONING_BUDGET || "0") || 0);
@@ -1661,12 +1661,23 @@ function prunePostCompactionToolOutputs(body, maxChars = POST_COMPACT_TOOL_OUTPU
   if (!body || typeof body !== "object" || !Array.isArray(body.input) || !body.input.some(isCompactionSummaryItem)) {
     return { foundSummary: false, truncated: 0, beforeChars: 0, afterChars: 0 };
   }
-  const estimatedChars = String(body.instructions || "").length + body.input.reduce((sum, item) => {
-    if (!item || typeof item !== "object") return sum;
-    const value = item.content ?? item.output ?? item.arguments ?? "";
-    return sum + String(typeof value === "string" ? value : JSON.stringify(value)).length;
-  }, 0);
-  const estimatedTokens = Math.ceil(estimatedChars / 4.0);
+  let estimatedChars = String(body.instructions || "").length;
+  if (Array.isArray(body.tools)) {
+    for (const tool of body.tools) {
+      estimatedChars += typeof tool === "string" ? tool.length : JSON.stringify(tool).length;
+    }
+  }
+  for (const item of body.input) {
+    if (!item || typeof item !== "object") continue;
+    if (item.type === "reasoning") {
+      const text = reasoningTextFromObject(item);
+      estimatedChars += text ? text.length : JSON.stringify(item).length;
+    } else {
+      const value = item.content ?? item.output ?? item.arguments ?? item.input ?? "";
+      estimatedChars += String(typeof value === "string" ? value : JSON.stringify(value)).length;
+    }
+  }
+  const estimatedTokens = Math.ceil(estimatedChars / 2.8);
   const pruneTrigger = SELFTEST_MODE ? 1000 : POST_COMPACT_PRUNE_TRIGGER_TOKENS;
   if (estimatedTokens < pruneTrigger) {
     return { foundSummary: true, truncated: 0, beforeChars: 0, afterChars: 0, estimatedTokens, deferred: true };
@@ -3026,8 +3037,8 @@ function createServer() {
           requestMeta.prepared = prepared;
           requestMeta.allowAutoContinue = isResponses && !requestMeta.isCompaction;
           if (memory.block) {
-            injectMemoryIntoInput(prepared.body, memory.block);
-            diag(`MEMORY injected (tail) count=${memory.count} chars=${memory.block.length} project=${JSON.stringify(memory.meta.project)}`);
+            prepared.body.instructions = `${String(prepared.body.instructions || "").trim()}\n\n${memory.block}`.trim();
+            diag(`MEMORY injected count=${memory.count} chars=${memory.block.length} project=${JSON.stringify(memory.meta.project)}`);
           }
           const priorityMarker = "POST-COMPACTION PRIORITY ORDER:";
           if (!String(prepared.body.instructions || "").includes(priorityMarker)) {
@@ -3477,6 +3488,33 @@ function createServer() {
             } else if ((ures.statusCode || 200) >= 400 && raw.length) {
               const kind = requestMeta.isCompaction ? "COMPACTION upstream error" : "upstream error";
               diag(`${kind} status=${ures.statusCode || 0} body=${raw.toString("utf8").slice(0, 4000)}`);
+            }
+
+            if ((ures.statusCode || 200) >= 400 && !responseCommitted && !attemptState.emergencyPruned && requestMeta.prepared?.body) {
+              const errBody = raw.toString("utf8");
+              if (/exceed_context_size_error|exceeds the available context size/i.test(errBody)) {
+                attemptState.emergencyPruned = true;
+                const pBody = requestMeta.prepared.body;
+                let pruned = 0;
+                if (Array.isArray(pBody.input)) {
+                  for (let i = 0; i < pBody.input.length - 2; i++) {
+                    const it = pBody.input[i];
+                    if (!it || (it.type !== "function_call_output" && it.type !== "custom_tool_call_output")) continue;
+                    const s = typeof it.output === "string" ? it.output : JSON.stringify(it.output ?? "");
+                    if (s.length > 2000) {
+                      it.output = s.slice(0, 1500) + "\n...[EMERGENCY CONTEXT OVERFLOW TRUNCATED]...\n" + s.slice(-500);
+                      pruned++;
+                    }
+                  }
+                }
+                if (pruned > 0) {
+                  diag(`EMERGENCY_OVERFLOW_RECOVERY pruned=${pruned} retrying attempt=${attempt + 1}`);
+                  outbound = Buffer.from(JSON.stringify(pBody));
+                  headers["content-length"] = String(outbound.length);
+                  startUpstreamAttempt(attempt + 1);
+                  return;
+                }
+              }
             }
 
             const rh = copyHeaders(ures.headers);
