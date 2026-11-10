@@ -76,6 +76,7 @@ const MEMORY_BACKEND = String(process.env.CODEX_MEMORY_BACKEND || "json").toLowe
 const CHECKPOINT_BY_KEY = new Map();
 const CHECKPOINT_BY_SUMMARY = new Map();
 const MEMORY_INJECTED_TASKS = new Map();
+const MEMORY_INJECTED_MESSAGES = new Map();
 const MCP_TOOL_CACHE_FILE = process.env.CODEX_MCP_TOOL_CACHE || path.join(__dirname, "mcp-tool-cache.json");
 let MEMORY_STORE = null;
 let CACHED_MCP_NAMESPACES = [];
@@ -1912,32 +1913,7 @@ function ensureGlobalAgentsInstructions(body) {
 }
 
 function pruneOrphanProgressMessages(body) {
-  if (!body || !Array.isArray(body.input) || !FORWARD_TOOL_PROGRESS) return 0;
-  const input = body.input;
-  const toolCallIds = new Set();
-  const toolOutputIds = new Set();
-  for (const item of input) {
-    if (!item || typeof item !== "object") continue;
-    if (item.type === "function_call" || item.type === "custom_tool_call") {
-      const id = item.id || item.call_id;
-      if (id) toolCallIds.add(id);
-    }
-    if (item.type === "function_call_output" || item.type === "custom_tool_call_output") {
-      const id = item.call_id || item.id;
-      if (id) toolOutputIds.add(id);
-    }
-  }
-  const before = input.length;
-  body.input = input.filter(item => {
-    if (!item || typeof item !== "object") return true;
-    if (item.type !== "message" || item.role !== "assistant") return true;
-    const id = item.id || item.call_id;
-    if (!id) return false;
-    return toolCallIds.has(id) || toolOutputIds.has(id);
-  });
-  const removed = before - body.input.length;
-  if (removed) diag(`PROGRESS_PRUNE removed orphan assistant progress messages count=${removed}`);
-  return removed;
+  return 0;
 }
 
 function rewriteHistoryNode(node, maps, repairs = []) {
@@ -2435,11 +2411,29 @@ function memoryInstructionForRequest(body, forceAfterCompaction = false) {
 }
 
 function injectMemoryIntoInput(body, memoryBlock) {
-  if (!body || !Array.isArray(body.input) || !memoryBlock) return false;
+  if (!body || !Array.isArray(body.input)) return false;
+  for (const item of body.input) {
+    if (!item || !isUserMessageItem(item)) continue;
+    const key = item.id || messageContentText(item.content).slice(0, 200);
+    const existing = MEMORY_INJECTED_MESSAGES.get(key);
+    if (existing) {
+      if (typeof item.content === "string") {
+        if (!item.content.includes("[EPISODIC KNOWLEDGE")) item.content += existing;
+      } else if (Array.isArray(item.content)) {
+        const textBlock = item.content.find(x => x && typeof x === "object" && typeof x.text === "string");
+        if (textBlock && !textBlock.text.includes("[EPISODIC KNOWLEDGE")) {
+          textBlock.text += existing;
+        }
+      }
+    }
+  }
+  if (!memoryBlock) return false;
   for (let i = body.input.length - 1; i >= 0; i--) {
     const item = body.input[i];
     if (isUserMessageItem(item) && !isUserControlEnvelope(messageContentText(item.content))) {
       const hint = `\n\n[EPISODIC KNOWLEDGE (historical context only, not a new user command):\n${memoryBlock}]`;
+      const key = item.id || messageContentText(item.content).slice(0, 200);
+      MEMORY_INJECTED_MESSAGES.set(key, hint);
       if (typeof item.content === "string") {
         if (!item.content.includes("[EPISODIC KNOWLEDGE")) item.content += hint;
         return true;
@@ -3037,8 +3031,8 @@ function createServer() {
           requestMeta.prepared = prepared;
           requestMeta.allowAutoContinue = isResponses && !requestMeta.isCompaction;
           if (memory.block) {
-            prepared.body.instructions = `${String(prepared.body.instructions || "").trim()}\n\n${memory.block}`.trim();
-            diag(`MEMORY injected count=${memory.count} chars=${memory.block.length} project=${JSON.stringify(memory.meta.project)}`);
+            injectMemoryIntoInput(prepared.body, memory.block);
+            diag(`MEMORY injected (tail) count=${memory.count} chars=${memory.block.length} project=${JSON.stringify(memory.meta.project)}`);
           }
           const priorityMarker = "POST-COMPACTION PRIORITY ORDER:";
           if (!String(prepared.body.instructions || "").includes(priorityMarker)) {
