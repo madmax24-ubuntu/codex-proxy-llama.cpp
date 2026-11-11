@@ -811,7 +811,7 @@ function storeBase64(blob) {
 }
 
 function foldLargeBase64Text(text) {
-  if (typeof text !== "string" || text.length < 512) return text;
+  if (typeof text !== "string" || text.length < 256) return text;
 
   // 1. Data URIs of any MIME type (>= 256 chars base64)
   let folded = text.replace(/data:([a-zA-Z0-9.+_-]+\/[a-zA-Z0-9.+_-]+);base64,([A-Za-z0-9+/=\s]{256,})/g, (match, mime, payload) => {
@@ -824,9 +824,10 @@ function foldLargeBase64Text(text) {
     return `data:${mime};base64,${head}...[BASE64_DATA_OMITTED: size=${sizeKb}KB, sha256=${hash}, hint: binary asset inlined on disk; keep intact or use scripts]...${tail}`;
   });
 
-  // 2. Raw long base64 strings (>= 512 chars)
-  folded = folded.replace(/(['"`:=,\s\[\(\n\r])([A-Za-z0-9+/]{512,}={0,2})(['"`:;,\s\]\)\n\r])/g, (match, p1, blob, p2) => {
+  // 2. Raw long base64 strings (>= 512 chars), including git diff (+/-), assignments, JSON quotes
+  folded = folded.replace(/(^|['"`:=,\s\[\(\n\r\+\-\\])([A-Za-z0-9+/]{512,}={0,2})(['"`:;,\s\]\)\n\r]|$)/gm, (match, p1, blob, p2) => {
     if (blob.includes("BASE64_DATA_OMITTED") || blob.includes("BASE64_BLOB_OMITTED")) return match;
+    if (!/[0-9]/.test(blob) || !/[a-z]/.test(blob) || !/[A-Z]/.test(blob)) return match;
     const hash = storeBase64(blob);
     const sizeKb = Math.round(blob.length / 1024);
     const head = blob.slice(0, 24);
@@ -4659,6 +4660,12 @@ function selftest() {
     const rehydratedPatch = decodeCustomArgs("apply_patch", JSON.stringify({ patch: testPatch }));
     if (!rehydratedPatch.includes(testRawB64)) {
       throw new Error("decodeCustomArgs apply_patch rehydration failed");
+    }
+
+    const gitDiffB64 = `diff --git a/embed.py b/embed.py\n--- a/embed.py\n+++ b/embed.py\n@@ -1,1 +1,1 @@\n-"${testRawB64}"\n+"${testRawB64}"\n`;
+    const foldedGitDiff = foldLargeBase64Text(gitDiffB64);
+    if (!foldedGitDiff.includes("BASE64_BLOB_OMITTED") || foldedGitDiff.length > 500) {
+      throw new Error("foldLargeBase64Text failed to collapse git diff base64");
     }
   } finally {
     memoryStore.close();
