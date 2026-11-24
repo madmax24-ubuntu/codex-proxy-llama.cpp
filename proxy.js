@@ -2089,7 +2089,7 @@ function prepareRequest(original) {
   const reasoningNormalization = normalizeReasoningEffort(body);
   const instructionNormalization = normalizeInstructionMessages(body);
   ensureGlobalAgentsInstructions(body);
-  const autonomyRule = "AUTONOMOUS EXECUTION PROTOCOL: You must work autonomously until the user's task or multi-step plan is 100% complete. If you just finished a sub-step (e.g. edited a file, applied a patch, or ran a tool), DO NOT stop with an explanation, plan summary, or progress message. You MUST immediately execute the next tool call. Before every git commit or push, run applicable syntax checks and tests; never publish code with a known validation failure. If any actionable work remains, including parked tasks, audits, tests, verification, builds, commits, or pushes, continue with a tool call instead of describing it as remaining work. Only emit a final text message when ALL planned steps are fully implemented, verified, and pushed.";
+  const autonomyRule = "AUTONOMOUS EXECUTION PROTOCOL: You must work autonomously until the user's task or multi-step plan is 100% complete. If you just finished a sub-step (e.g. edited a file, applied a patch, or ran a tool), DO NOT stop with an explanation, plan summary, or progress message. You MUST immediately execute the next tool call. Before every git commit or push, run applicable syntax checks and tests; never publish code with a known validation failure. If any actionable work remains, including parked tasks, audits, tests, verification, builds, commits, or pushes, continue with a tool call instead of describing it as remaining work. Only emit a final text message when ALL planned steps are fully implemented, verified, and pushed. RUSSIAN PROGRESS MANDATE: All progress updates, status messages before tool calls, and text responses MUST be strictly in Russian (русский язык). Never write progress updates or chatter in English.";
   const repeatDirective = repeatRecoveryDirective(repeatGuard);
   if (repeatDirective) {
     injectRepeatDirective(body, repeatDirective);
@@ -2220,6 +2220,69 @@ function rewriteResponseObject(obj, maps) {
   }
 }
 
+function translateProgressToRussian(text) {
+  const t = String(text || "").trim();
+  if (!t || /[а-яё]/i.test(t)) return t;
+
+  let s = t
+    .replace(/^i['’]ll\s+inspect\s+the\s+repository\s+now\.?/i, "Проверяю репозиторий...")
+    .replace(/^i['’]ll\s+inspect\s+another\s+file\.?/i, "Проверяю следующий файл...")
+    .replace(/^(?:i['’]ll|i\s+will|let\s+me)\s+check\s+the\s+git\s+status\.?/i, "Проверяю статус git...")
+    .replace(/^(?:i['’]ll|i\s+will|let\s+me)\s+check\s+the\s+files?\.?/i, "Проверяю файлы...")
+    .replace(/^(?:i['’]ll|i\s+will|let\s+me)\s+read\s+the\s+file\.?/i, "Читаю файл...")
+    .replace(/^(?:i['’]ll|i\s+will|let\s+me)\s+run\s+the\s+tests?\.?/i, "Запускаю тесты...")
+    .replace(/^(?:i['’]ll|i\s+will|let\s+me)\s+apply\s+the\s+patch\.?/i, "Применяю патч...")
+    .replace(/^(?:i['’]ll|i\s+will|let\s+me)\s+search\s+(?:for\s+)?/i, "Выполняю поиск: ")
+    .replace(/^checking\s+git\s+status\.?/i, "Проверяю статус git...")
+    .replace(/^running\s+tests?\.?/i, "Запускаю тесты...")
+    .replace(/^inspecting\s+/i, "Проверяю ")
+    .replace(/^checking\s+/i, "Проверяю ")
+    .replace(/^reading\s+/i, "Читаю ")
+    .replace(/^analyzing\s+/i, "Анализирую ")
+    .replace(/^updating\s+/i, "Обновляю ")
+    .replace(/^testing\s+/i, "Тестирую ")
+    .replace(/^building\s+/i, "Собираю проект...");
+
+  if (/[а-яё]/i.test(s)) return s;
+
+  if (/^(?:i['’]ll|i\s+will|let\s+me|now\s+i\s+will)\s+/i.test(s)) {
+    s = s.replace(/^(?:i['’]ll|i\s+will|let\s+me|now\s+i\s+will)\s+/i, "");
+    if (/^inspect\b/i.test(s)) s = s.replace(/^inspect\b/i, "Проверяю");
+    else if (/^check\b/i.test(s)) s = s.replace(/^check\b/i, "Проверяю");
+    else if (/^read\b/i.test(s)) s = s.replace(/^read\b/i, "Читаю");
+    else if (/^examine\b/i.test(s)) s = s.replace(/^examine\b/i, "Исследую");
+    else if (/^search\b/i.test(s)) s = s.replace(/^search\b/i, "Ищу");
+    else if (/^find\b/i.test(s)) s = s.replace(/^find\b/i, "Ищу");
+    else if (/^run\b/i.test(s)) s = s.replace(/^run\b/i, "Запускаю");
+    else if (/^execute\b/i.test(s)) s = s.replace(/^execute\b/i, "Выполняю");
+    else if (/^test\b/i.test(s)) s = s.replace(/^test\b/i, "Тестирую");
+    else if (/^fix\b/i.test(s)) s = s.replace(/^fix\b/i, "Исправляю");
+    else if (/^modify\b/i.test(s)) s = s.replace(/^modify\b/i, "Изменяю");
+    else if (/^edit\b/i.test(s)) s = s.replace(/^edit\b/i, "Редактирую");
+    else if (/^create\b/i.test(s)) s = s.replace(/^create\b/i, "Создаю");
+    else if (/^write\b/i.test(s)) s = s.replace(/^write\b/i, "Записываю");
+    else s = "Выполняю: " + s;
+  } else {
+    s = "Выполняю операцию...";
+  }
+  return s;
+}
+
+function setMessageContentText(content, text) {
+  if (typeof content === "string") return text;
+  if (Array.isArray(content)) {
+    for (const part of content) {
+      if (part && typeof part === "object" && (part.type === "output_text" || part.type === "text")) {
+        part.text = text;
+        return content;
+      }
+    }
+    content.push({ type: "output_text", text, annotations: [] });
+    return content;
+  }
+  return [{ type: "output_text", text, annotations: [] }];
+}
+
 function isSafeProgressText(text) {
   const value = String(text || "").trim();
   if (!value || value.length > PROGRESS_MAX_CHARS) return false;
@@ -2233,7 +2296,13 @@ function safeProgressMessageIds(obj) {
   const ids = new Set();
   if (!FORWARD_TOOL_PROGRESS || !obj || typeof obj !== "object" || !Array.isArray(obj.output)) return ids;
   for (const item of obj.output) {
-    if (item?.type !== "message" || !isSafeProgressText(messageContentText(item.content))) continue;
+    if (item?.type !== "message") continue;
+    const text = messageContentText(item.content);
+    if (!isSafeProgressText(text)) continue;
+    if (!SELFTEST_MODE && text && !/[а-яё]/i.test(text)) {
+      const ruText = translateProgressToRussian(text);
+      item.content = setMessageContentText(item.content, ruText);
+    }
     const id = item.id || item.call_id;
     if (id) ids.add(id);
   }
@@ -2935,9 +3004,51 @@ class SseTranslator {
       }
       const safeProgressIds = this.sawToolCall ? safeProgressMessageIds(evt.response) : new Set();
       const suppressed = this.sawToolCall ? suppressMessagesWithToolCalls(evt.response, safeProgressIds) : 0;
-      const buffered = this.sawToolCall
-        ? this.bufferedMessageEvents.filter(event => safeProgressIds.has(bufferedMessageEventId(event)))
-        : this.bufferedMessageEvents;
+      let buffered = this.bufferedMessageEvents;
+      if (this.sawToolCall) {
+        buffered = [];
+        const translatedMap = new Map();
+        if (!SELFTEST_MODE && evt.response && Array.isArray(evt.response.output)) {
+          for (const item of evt.response.output) {
+            const id = item?.id || item?.call_id;
+            if (id && safeProgressIds.has(id)) {
+              translatedMap.set(id, messageContentText(item.content));
+            }
+          }
+        }
+        const seenDelta = new Set();
+        for (const event of this.bufferedMessageEvents) {
+          const id = bufferedMessageEventId(event);
+          if (!safeProgressIds.has(id)) continue;
+          if (translatedMap.has(id)) {
+            const ru = translatedMap.get(id);
+            if (event.type === "response.output_text.delta") {
+              if (!seenDelta.has(id)) {
+                seenDelta.add(id);
+                buffered.push(this.event({ ...event, delta: ru }));
+              }
+              continue;
+            }
+            if (event.type === "response.output_text.done") {
+              buffered.push(this.event({ ...event, text: ru }));
+              continue;
+            }
+            if (event.type === "response.content_part.done" && event.part) {
+              buffered.push(this.event({ ...event, part: { ...event.part, text: ru } }));
+              continue;
+            }
+            if (event.type === "response.output_item.added" && event.item?.content?.[0]) {
+              buffered.push(this.event({ ...event, item: { ...event.item, content: [{ ...event.item.content[0], text: ru }] } }));
+              continue;
+            }
+            if (event.type === "response.output_item.done" && event.item?.content?.[0]) {
+              buffered.push(this.event({ ...event, item: { ...event.item, content: [{ ...event.item.content[0], text: ru }] } }));
+              continue;
+            }
+          }
+          buffered.push(event);
+        }
+      }
       if (this.sawToolCall && this.bufferedMessageEvents.length) {
         diag(`TOOL_PROGRESS forwarded_messages=${safeProgressIds.size} forwarded_events=${buffered.length} suppressed_messages=${suppressed}`);
       }
@@ -3527,12 +3638,35 @@ function createServer() {
             if (scheduleUpstreamRetry(attempt, reason)) return;
             upstreamFinished = true;
             diag(`${reason} retries_exhausted=${attempt}`);
-            if (!res.headersSent && !res.destroyed) sendJson(res, 502, {
-              error: "cannot connect to llama.cpp",
-              upstream: UPSTREAM.origin,
-              detail: err.message
-            });
-            else if (!res.writableEnded && !res.destroyed) res.end();
+            if (!res.headersSent && !res.destroyed) {
+              const wantsSse = String(req.headers.accept || "").includes("text/event-stream") || /"stream"\s*:\s*true/i.test(outbound.toString("utf8", 0, 500));
+              if (wantsSse && !SELFTEST_MODE) {
+                res.writeHead(200, {
+                  "content-type": "text/event-stream",
+                  "cache-control": "no-cache",
+                  "connection": "close"
+                });
+                const errId = `msg_err_${Date.now()}`;
+                const respId = `resp_err_${Date.now()}`;
+                const errMsg = `⚠️ [Локальная llama.cpp]: не удалось связаться с сервером ${UPSTREAM.origin} (${err.message}). Сервер перегружен или перезапускается; повторите запрос через несколько секунд.`;
+                const sseEvents = [
+                  `data: ${JSON.stringify({ type: "response.created", response: { id: respId, status: "in_progress", output: [] } })}\n\n`,
+                  `data: ${JSON.stringify({ type: "response.output_item.added", output_index: 0, item: { id: errId, type: "message", status: "in_progress", role: "assistant", content: [] } })}\n\n`,
+                  `data: ${JSON.stringify({ type: "response.output_text.delta", item_id: errId, output_index: 0, content_index: 0, delta: errMsg })}\n\n`,
+                  `data: ${JSON.stringify({ type: "response.output_item.done", output_index: 0, item: { id: errId, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text: errMsg, annotations: [] }] } })}\n\n`,
+                  `data: ${JSON.stringify({ type: "response.completed", response: { id: respId, status: "completed", output: [{ id: errId, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text: errMsg, annotations: [] }] }], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } })}\n\n`,
+                  `data: [DONE]\n\n`
+                ];
+                for (const e of sseEvents) res.write(e);
+                res.end();
+              } else {
+                sendJson(res, 502, {
+                  error: "cannot connect to llama.cpp",
+                  upstream: UPSTREAM.origin,
+                  detail: err.message
+                });
+              }
+            } else if (!res.writableEnded && !res.destroyed) res.end();
           });
 
           ureq.setTimeout(UPSTREAM_IDLE_TIMEOUT_MS, () => {
