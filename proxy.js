@@ -2095,8 +2095,17 @@ function prepareRequest(original) {
     injectRepeatDirective(body, repeatDirective);
     diag(`REPEAT_GUARD recover (tail) name=${JSON.stringify(repeatGuard.name)} count=${repeatGuard.count} signature=${crypto.createHash("sha256").update(repeatGuard.signature).digest("hex").slice(0, 12)}`);
   }
-  if (typeof body.instructions === "string" && !body.instructions.includes("AUTONOMOUS EXECUTION PROTOCOL:")) {
-    body.instructions = `${body.instructions.trim()}\n\n${autonomyRule}`;
+  if (typeof body.instructions === "string") {
+    if (!body.instructions.includes("RUSSIAN PROGRESS MANDATE:")) {
+      if (body.instructions.includes("AUTONOMOUS EXECUTION PROTOCOL:")) {
+        body.instructions = body.instructions.replace(/AUTONOMOUS EXECUTION PROTOCOL:[^\n]*(?:\n[^\n]*)*/, autonomyRule);
+        if (!body.instructions.includes("RUSSIAN PROGRESS MANDATE:")) {
+          body.instructions = `${body.instructions.trim()}\n\n${autonomyRule}`;
+        }
+      } else {
+        body.instructions = `${body.instructions.trim()}\n\n${autonomyRule}`;
+      }
+    }
   } else if (!body.instructions) {
     body.instructions = autonomyRule;
   }
@@ -2262,10 +2271,17 @@ function translateProgressToRussian(text) {
     else if (/^create\b/i.test(s)) s = s.replace(/^create\b/i, "Создаю");
     else if (/^write\b/i.test(s)) s = s.replace(/^write\b/i, "Записываю");
     else s = "Выполняю: " + s;
-  } else {
-    s = "Выполняю операцию...";
+    return s;
   }
-  return s;
+
+  if (/ping|curl|wget|fetch|download/i.test(t)) return "Выполняю сетевой запрос...";
+  if (/connect|ssh|tunnel|port|handshake/i.test(t)) return "Проверяю подключение...";
+  if (/test|verify|experiment|assert/i.test(t)) return "Запускаю проверку...";
+  if (/git\s+status|git\s+diff|commit/i.test(t)) return "Проверяю статус git...";
+  if (/build|compile/i.test(t)) return "Собираю проект...";
+  if (/search|find|grep/i.test(t)) return "Выполняю поиск...";
+  if (/file|read|inspect/i.test(t)) return "Проверяю файлы...";
+  return "Выполняю операцию...";
 }
 
 function setMessageContentText(content, text) {
@@ -2299,7 +2315,7 @@ function safeProgressMessageIds(obj) {
     if (item?.type !== "message") continue;
     const text = messageContentText(item.content);
     if (!isSafeProgressText(text)) continue;
-    if (!SELFTEST_MODE && text && !/[а-яё]/i.test(text)) {
+    if (text && !/[а-яё]/i.test(text)) {
       const ruText = translateProgressToRussian(text);
       item.content = setMessageContentText(item.content, ruText);
     }
@@ -3008,7 +3024,7 @@ class SseTranslator {
       if (this.sawToolCall) {
         buffered = [];
         const translatedMap = new Map();
-        if (!SELFTEST_MODE && evt.response && Array.isArray(evt.response.output)) {
+        if (evt.response && Array.isArray(evt.response.output)) {
           for (const item of evt.response.output) {
             const id = item?.id || item?.call_id;
             if (id && safeProgressIds.has(id)) {
@@ -3017,36 +3033,50 @@ class SseTranslator {
           }
         }
         const seenDelta = new Set();
-        for (const event of this.bufferedMessageEvents) {
-          const id = bufferedMessageEventId(event);
+        for (const rawEvent of this.bufferedMessageEvents) {
+          const id = bufferedMessageEventId(rawEvent);
           if (!safeProgressIds.has(id)) continue;
-          if (translatedMap.has(id)) {
-            const ru = translatedMap.get(id);
-            if (event.type === "response.output_text.delta") {
-              if (!seenDelta.has(id)) {
-                seenDelta.add(id);
-                buffered.push(this.event({ ...event, delta: ru }));
-              }
-              continue;
+          let eventObj = null;
+          if (typeof rawEvent === "string") {
+            try {
+              eventObj = JSON.parse(rawEvent.replace(/^data:\s*/, "").trim());
+            } catch {
+              eventObj = null;
             }
-            if (event.type === "response.output_text.done") {
-              buffered.push(this.event({ ...event, text: ru }));
-              continue;
-            }
-            if (event.type === "response.content_part.done" && event.part) {
-              buffered.push(this.event({ ...event, part: { ...event.part, text: ru } }));
-              continue;
-            }
-            if (event.type === "response.output_item.added" && event.item?.content?.[0]) {
-              buffered.push(this.event({ ...event, item: { ...event.item, content: [{ ...event.item.content[0], text: ru }] } }));
-              continue;
-            }
-            if (event.type === "response.output_item.done" && event.item?.content?.[0]) {
-              buffered.push(this.event({ ...event, item: { ...event.item, content: [{ ...event.item.content[0], text: ru }] } }));
-              continue;
-            }
+          } else if (rawEvent && typeof rawEvent === "object") {
+            eventObj = rawEvent;
           }
-          buffered.push(event);
+          if (!eventObj || !translatedMap.has(id)) {
+            buffered.push(typeof rawEvent === "string" ? rawEvent : this.event(rawEvent));
+            continue;
+          }
+          const ru = translatedMap.get(id);
+          if (eventObj.type === "response.output_text.delta") {
+            if (!seenDelta.has(id)) {
+              seenDelta.add(id);
+              buffered.push(this.event({ ...eventObj, delta: ru }));
+            }
+            continue;
+          }
+          if (eventObj.type === "response.output_text.done") {
+            buffered.push(this.event({ ...eventObj, text: ru }));
+            continue;
+          }
+          if (eventObj.type === "response.content_part.done" && eventObj.part) {
+            buffered.push(this.event({ ...eventObj, part: { ...eventObj.part, text: ru } }));
+            continue;
+          }
+          if (eventObj.type === "response.output_item.added") {
+            buffered.push(this.event(eventObj));
+            continue;
+          }
+          if (eventObj.type === "response.output_item.done") {
+            const item = eventObj.item || {};
+            const content = [{ type: "output_text", text: ru, annotations: [] }];
+            buffered.push(this.event({ ...eventObj, item: { ...item, content } }));
+            continue;
+          }
+          buffered.push(typeof rawEvent === "string" ? rawEvent : this.event(eventObj));
         }
       }
       if (this.sawToolCall && this.bufferedMessageEvents.length) {
@@ -4169,6 +4199,7 @@ function selftest() {
       (toolChatterCompleted.length !== 3 ||
        toolChatterCompleted[0]?.type !== "response.output_item.added" ||
        toolChatterCompleted[1]?.type !== "response.output_text.delta" ||
+       toolChatterCompleted[1]?.delta !== "Проверяю следующий файл..." ||
        !toolChatterCompleted[2]?.response?.output?.some(x => x.type === "message"))) {
     throw new Error("safe tool-progress forwarding failed");
   }
