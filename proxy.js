@@ -32,7 +32,7 @@ const path = require("path");
 const crypto = require("crypto");
 const os = require("os");
 
-const VERSION = "1.0.0";
+const VERSION = "1.0.1";
 const SELFTEST_MODE = process.argv.includes("--selftest");
 
 const HOST = process.env.CODEX_PROXY_HOST || "127.0.0.1";

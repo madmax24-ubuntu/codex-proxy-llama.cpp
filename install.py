@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 MARKER = "generated_by_codex_proxy_llama_cpp"
 
 
@@ -153,7 +153,7 @@ def language_instruction(language: str) -> str:
     if not language:
         return ""
     return (
-        f"Always communicate with the user in {language}. Never switch languages because code, logs, tools, or "
+        f"Always communicate with the user in {language}. All progress updates, status messages, and notifications before tool calls must be strictly in {language}. Never switch languages because code, logs, tools, or "
         f"documentation use another language. Preserve code, commands, identifiers, paths, and exact errors as written."
     )
 
