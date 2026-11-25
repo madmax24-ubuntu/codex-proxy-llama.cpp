@@ -63,6 +63,226 @@ const CACHE_PROMPT = !/^(0|false|no)$/i.test(process.env.CODEX_CACHE_PROMPT || "
 const LLAMA_SLOT = Number.isInteger(Number(process.env.CODEX_LLAMA_SLOT)) ? Number(process.env.CODEX_LLAMA_SLOT) : 0;
 const UPSTREAM_RETRY_ATTEMPTS = Math.max(0, Math.min(60, Number(process.env.CODEX_UPSTREAM_RETRY_ATTEMPTS || "30") || 30));
 const UPSTREAM_RETRY_BASE_MS = Math.max(100, Number(process.env.CODEX_UPSTREAM_RETRY_BASE_MS || "1000") || 1000);
+const MAX_EMERGENCY_OVERFLOW_RETRIES = 4;
+const CODEX_ADVERTISED_EFFECTIVE_CTX = Math.max(4096, Number(process.env.CODEX_ADVERTISED_EFFECTIVE_CTX || "120064") || 120064);
+
+const MODEL_CONTEXT_STATE = {
+  modelKey: "",
+  nCtx: 0,
+  charsPerToken: 2.8,
+  sampleCount: 0,
+  lastPropsFetchMs: 0,
+  propsInFlight: null
+};
+
+function effectiveNCtx() {
+  if (MODEL_CONTEXT_STATE.nCtx > 0) return MODEL_CONTEXT_STATE.nCtx;
+  return POST_COMPACT_PRUNE_TRIGGER_TOKENS > 0 ? Math.round(POST_COMPACT_PRUNE_TRIGGER_TOKENS / 0.93) : 120064;
+}
+
+function estimateRequestChars(body) {
+  if (!body || typeof body !== "object") return 0;
+  let total = String(body.instructions || "").length;
+  if (Array.isArray(body.tools)) {
+    for (const tool of body.tools) {
+      total += typeof tool === "string" ? tool.length : JSON.stringify(tool).length;
+    }
+  }
+  if (Array.isArray(body.input)) {
+    for (const item of body.input) {
+      if (!item || typeof item !== "object") continue;
+      if (item.type === "reasoning") {
+        const text = reasoningTextFromObject(item);
+        total += text ? text.length : JSON.stringify(item).length;
+      } else {
+        const value = item.content ?? item.output ?? item.arguments ?? item.input ?? "";
+        total += String(typeof value === "string" ? value : JSON.stringify(value)).length;
+      }
+    }
+  }
+  return total;
+}
+
+function estimateTokensForBody(body) {
+  const chars = estimateRequestChars(body);
+  const cpt = Math.max(1.1, Math.min(5.0, MODEL_CONTEXT_STATE.charsPerToken || 2.8));
+  return Math.ceil(chars / cpt);
+}
+
+function calibrateTokensFromActual(chars, actualTokens) {
+  if (!Number.isFinite(chars) || !Number.isFinite(actualTokens) || chars < 200 || actualTokens < 100) return false;
+  const ratio = Math.max(1.1, Math.min(5.0, chars / actualTokens));
+  if (MODEL_CONTEXT_STATE.sampleCount === 0) {
+    MODEL_CONTEXT_STATE.charsPerToken = ratio;
+  } else {
+    MODEL_CONTEXT_STATE.charsPerToken = MODEL_CONTEXT_STATE.charsPerToken * 0.5 + ratio * 0.5;
+  }
+  MODEL_CONTEXT_STATE.sampleCount++;
+  return true;
+}
+
+function fetchUpstreamJson(urlPath, timeoutMs = 1200) {
+  return new Promise(resolve => {
+    try {
+      const transport = UPSTREAM.protocol === "https:" ? https : http;
+      const req = transport.request({
+        protocol: UPSTREAM.protocol,
+        hostname: UPSTREAM.hostname,
+        port: UPSTREAM.port || (UPSTREAM.protocol === "https:" ? 443 : 80),
+        method: "GET",
+        path: urlPath,
+        timeout: timeoutMs
+      }, res => {
+        const chunks = [];
+        res.on("data", c => chunks.push(c));
+        res.on("end", () => {
+          try {
+            if ((res.statusCode || 0) >= 200 && (res.statusCode || 0) < 300) {
+              resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+              return;
+            }
+          } catch {}
+          resolve(null);
+        });
+      });
+      req.on("timeout", () => { try { req.destroy(); } catch {} resolve(null); });
+      req.on("error", () => resolve(null));
+      req.end();
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+async function refreshUpstreamProps(force = false) {
+  if (SELFTEST_MODE) return MODEL_CONTEXT_STATE;
+  const now = Date.now();
+  if (!force && now - MODEL_CONTEXT_STATE.lastPropsFetchMs < 30000) return MODEL_CONTEXT_STATE;
+  if (MODEL_CONTEXT_STATE.propsInFlight) return MODEL_CONTEXT_STATE.propsInFlight;
+  MODEL_CONTEXT_STATE.propsInFlight = (async () => {
+    try {
+      let nCtx = 0;
+      let modelKey = "";
+      const props = await fetchUpstreamJson("/props", 1200);
+      if (props && typeof props === "object") {
+        nCtx = Number(props.default_generation_settings?.n_ctx || props.n_ctx || 0) || 0;
+        modelKey = String(props.model_path || props.model_alias || "");
+      }
+      if (!nCtx) {
+        const models = await fetchUpstreamJson("/v1/models", 1200);
+        const first = Array.isArray(models?.data) ? models.data[0] : null;
+        if (first) {
+          nCtx = Number(first.meta?.n_ctx || 0) || 0;
+          if (!modelKey) modelKey = String(first.id || "");
+        }
+      }
+      MODEL_CONTEXT_STATE.lastPropsFetchMs = Date.now();
+      if (nCtx > 0 && (nCtx !== MODEL_CONTEXT_STATE.nCtx || (modelKey && modelKey !== MODEL_CONTEXT_STATE.modelKey))) {
+        const prevCtx = MODEL_CONTEXT_STATE.nCtx;
+        const prevKey = MODEL_CONTEXT_STATE.modelKey;
+        MODEL_CONTEXT_STATE.nCtx = nCtx;
+        if (modelKey) MODEL_CONTEXT_STATE.modelKey = modelKey;
+        if (prevKey && modelKey && prevKey !== modelKey) {
+          MODEL_CONTEXT_STATE.charsPerToken = 2.8;
+          MODEL_CONTEXT_STATE.sampleCount = 0;
+        }
+        diag(`CONTEXT_PROFILE_DETECTED model=${JSON.stringify(MODEL_CONTEXT_STATE.modelKey || "unknown")} n_ctx=${nCtx} prev_ctx=${prevCtx}`);
+      }
+    } finally {
+      MODEL_CONTEXT_STATE.propsInFlight = null;
+    }
+    return MODEL_CONTEXT_STATE;
+  })();
+  return MODEL_CONTEXT_STATE.propsInFlight;
+}
+
+function scaleUsageForCodex(usage) {
+  if (!usage || typeof usage !== "object") return usage;
+  const nCtx = MODEL_CONTEXT_STATE.nCtx;
+  if (!nCtx || nCtx >= Math.floor(CODEX_ADVERTISED_EFFECTIVE_CTX * 0.92)) return usage;
+  const scale = CODEX_ADVERTISED_EFFECTIVE_CTX / nCtx;
+  const inTok = finiteInt(usage.input_tokens ?? usage.prompt_tokens);
+  const outTok = finiteInt(usage.output_tokens ?? usage.completion_tokens) || 0;
+  if (inTok != null) {
+    const scaledIn = Math.round(inTok * scale);
+    usage.input_tokens = scaledIn;
+    usage.total_tokens = scaledIn + outTok;
+    if (usage.input_tokens_details && finiteInt(usage.input_tokens_details.cached_tokens) != null) {
+      usage.input_tokens_details.cached_tokens = Math.round(usage.input_tokens_details.cached_tokens * scale);
+    }
+  }
+  return usage;
+}
+
+function emergencyPruneForOverflow(body, round, actualPromptTokens = 0, nCtx = 0) {
+  if (!body || typeof body !== "object" || !Array.isArray(body.input)) {
+    return { pruned: 0, removed: 0, beforeLen: 0, afterLen: 0 };
+  }
+  const beforeLen = JSON.stringify(body).length;
+  let pruned = 0;
+  let removed = 0;
+
+  if (round === 1) {
+    for (let i = 0; i < Math.max(0, body.input.length - 2); i++) {
+      const it = body.input[i];
+      if (!it || (it.type !== "function_call_output" && it.type !== "custom_tool_call_output")) continue;
+      const s = typeof it.output === "string" ? it.output : JSON.stringify(it.output ?? "");
+      if (s.length > 800) {
+        it.output = s.slice(0, 450) + "\n...[EMERGENCY OVERFLOW TRUNCATED]...\n" + s.slice(-200);
+        pruned++;
+      }
+    }
+  } else if (round === 2) {
+    for (let i = 0; i < Math.max(0, body.input.length - 1); i++) {
+      const it = body.input[i];
+      if (!it) continue;
+      if (it.type === "function_call_output" || it.type === "custom_tool_call_output") {
+        const s = typeof it.output === "string" ? it.output : JSON.stringify(it.output ?? "");
+        if (s.length > 300) {
+          it.output = s.slice(0, 150) + "\n...[TRUNCATED]...\n" + s.slice(-80);
+          pruned++;
+        }
+      }
+    }
+    const lastReasoningIdx = body.input.map((x, idx) => x?.type === "reasoning" ? idx : -1).filter(idx => idx >= 0).pop() ?? -1;
+    body.input = body.input.filter((x, idx) => {
+      if (x?.type === "reasoning" && idx !== lastReasoningIdx) {
+        removed++;
+        return false;
+      }
+      return true;
+    });
+  } else if (round === 3) {
+    const excessTokens = Math.max(4000, (actualPromptTokens && nCtx ? actualPromptTokens - nCtx : 16000) + 4096);
+    const targetDropChars = Math.ceil(excessTokens * (MODEL_CONTEXT_STATE.charsPerToken || 2.8));
+    let droppedChars = 0;
+    const keepHead = body.input.slice(0, 2);
+    const keepTailCount = Math.min(4, Math.max(2, body.input.length - 2));
+    const middle = body.input.slice(2, body.input.length - keepTailCount);
+    const tail = body.input.slice(body.input.length - keepTailCount);
+    const keptMiddle = [];
+    for (const item of middle) {
+      if (droppedChars < targetDropChars && !isCompactionSummaryItem(item)) {
+        droppedChars += JSON.stringify(item).length;
+        removed++;
+        continue;
+      }
+      keptMiddle.push(item);
+    }
+    body.input = [...keepHead, ...keptMiddle, ...tail];
+  } else {
+    const preserved = [];
+    for (let i = 0; i < body.input.length; i++) {
+      const it = body.input[i];
+      if (i >= body.input.length - 2 || isCompactionSummaryItem(it)) preserved.push(it);
+      else removed++;
+    }
+    body.input = preserved;
+  }
+
+  const afterLen = JSON.stringify(body).length;
+  return { pruned, removed, beforeLen, afterLen };
+}
 const UPSTREAM_RETRY_MAX_MS = Math.max(UPSTREAM_RETRY_BASE_MS, Number(process.env.CODEX_UPSTREAM_RETRY_MAX_MS || "10000") || 10000);
 const UPSTREAM_IDLE_TIMEOUT_MS = Math.max(100, Number(process.env.CODEX_UPSTREAM_IDLE_TIMEOUT_MS || "300000") || 300000);
 const DOWNSTREAM_HEARTBEAT_MS = Math.max(50, Number(process.env.CODEX_DOWNSTREAM_HEARTBEAT_MS || "30000") || 30000);
@@ -1663,24 +1883,10 @@ function prunePostCompactionToolOutputs(body, maxChars = POST_COMPACT_TOOL_OUTPU
   if (!body || typeof body !== "object" || !Array.isArray(body.input) || !body.input.some(isCompactionSummaryItem)) {
     return { foundSummary: false, truncated: 0, beforeChars: 0, afterChars: 0 };
   }
-  let estimatedChars = String(body.instructions || "").length;
-  if (Array.isArray(body.tools)) {
-    for (const tool of body.tools) {
-      estimatedChars += typeof tool === "string" ? tool.length : JSON.stringify(tool).length;
-    }
-  }
-  for (const item of body.input) {
-    if (!item || typeof item !== "object") continue;
-    if (item.type === "reasoning") {
-      const text = reasoningTextFromObject(item);
-      estimatedChars += text ? text.length : JSON.stringify(item).length;
-    } else {
-      const value = item.content ?? item.output ?? item.arguments ?? item.input ?? "";
-      estimatedChars += String(typeof value === "string" ? value : JSON.stringify(value)).length;
-    }
-  }
-  const estimatedTokens = Math.ceil(estimatedChars / 2.8);
-  const pruneTrigger = SELFTEST_MODE ? 1000 : POST_COMPACT_PRUNE_TRIGGER_TOKENS;
+  const estimatedChars = estimateRequestChars(body);
+  const estimatedTokens = Math.ceil(estimatedChars / Math.max(1.1, Math.min(5.0, MODEL_CONTEXT_STATE.charsPerToken || 2.8)));
+  const dynamicTrigger = Math.floor(effectiveNCtx() * 0.88);
+  const pruneTrigger = SELFTEST_MODE ? 1000 : Math.min(POST_COMPACT_PRUNE_TRIGGER_TOKENS, dynamicTrigger);
   if (estimatedTokens < pruneTrigger) {
     return { foundSummary: true, truncated: 0, beforeChars: 0, afterChars: 0, estimatedTokens, deferred: true };
   }
@@ -1721,7 +1927,7 @@ function prunePostCompactionToolOutputs(body, maxChars = POST_COMPACT_TOOL_OUTPU
     if (typeof item.output !== "string") continue;
     outputs.push({ index, chars: item.output.length, source: sourceCall(index) });
   }
-  if (!ENABLE_POST_COMPACT_TOOL_PRUNE && !SELFTEST_MODE) {
+  if (!ENABLE_POST_COMPACT_TOOL_PRUNE && !SELFTEST_MODE && estimatedTokens < Math.floor(effectiveNCtx() * 0.90)) {
     return { foundSummary: true, truncated: 0, beforeChars: 0, afterChars: 0, estimatedTokens, deferred: true, retainedSourceChars: 0, retainedToolChars: 0 };
   }
   const protectedIndexes = new Set(outputs.slice(-keepRecent).map(item => item.index));
@@ -2122,6 +2328,27 @@ function prepareRequest(original) {
   // Autonomy protocol is maintained cleanly in instructions without polluting input history turns.
 
   const historyRepairs = rewriteHistoryNode(body.input, maps);
+
+  if (!SELFTEST_MODE && Array.isArray(body.input)) {
+    const nCtx = effectiveNCtx();
+    const estTokens = estimateTokensForBody(body);
+    if (estTokens >= Math.floor(nCtx * 0.90)) {
+      const targetCharMax = estTokens >= Math.floor(nCtx * 0.95) ? 1200 : 2500;
+      let prePruned = 0;
+      for (let i = 0; i < Math.max(0, body.input.length - 4); i++) {
+        const it = body.input[i];
+        if (!it || (it.type !== "function_call_output" && it.type !== "custom_tool_call_output")) continue;
+        if (typeof it.output !== "string" || it.output.length <= targetCharMax) continue;
+        const head = Math.floor(targetCharMax * 0.65);
+        const tail = Math.max(100, targetCharMax - head - 60);
+        it.output = it.output.slice(0, head) + "\n...[PREFLIGHT CONTEXT PRUNED]...\n" + it.output.slice(-tail);
+        prePruned++;
+      }
+      if (prePruned > 0) {
+        diag(`PREFLIGHT_CONTEXT_GUARD est_tokens=${estTokens} n_ctx=${nCtx} cpt=${MODEL_CONTEXT_STATE.charsPerToken.toFixed(2)} pruned=${prePruned}`);
+      }
+    }
+  }
 
   if (MAX_OUTPUT_TOKENS > 0) {
     const requested = Number(body.max_output_tokens);
@@ -2625,6 +2852,7 @@ function normalizeCompletedForCodex(evt) {
   usage.input_tokens = input;
   usage.output_tokens = output;
   usage.total_tokens = total;
+  scaleUsageForCodex(usage);
 
   if (usage.input_tokens_details && typeof usage.input_tokens_details === "object") {
     if (finiteInt(usage.input_tokens_details.cached_tokens) == null) {
@@ -2999,6 +3227,11 @@ class SseTranslator {
     rewriteResponseObject(evt, this.maps);
 
     if (evt.type === "response.completed") {
+      const rawInputTokens = finiteInt(evt.response?.usage?.input_tokens ?? evt.response?.usage?.prompt_tokens);
+      if (rawInputTokens && this.requestMeta.requestChars) {
+        calibrateTokensFromActual(this.requestMeta.requestChars, rawInputTokens);
+      }
+      if (!SELFTEST_MODE && rawInputTokens > 50) refreshUpstreamProps(false);
       normalizeCompletedForCodex(evt);
       const usage = usageFrom(evt);
       const outputLimitHit = this.requestMeta.isCompaction &&
@@ -3149,7 +3382,7 @@ function createServer() {
           req.method === "POST" &&
           (req.url === "/v1/responses" || req.url === "/responses");
 
-        let requestMeta = { isCompaction: false, requestBytes: decoded.length, cacheKey: "default", checkpointPath: null, fingerprint: "", memoryTask: null };
+        let requestMeta = { isCompaction: false, requestBytes: decoded.length, requestChars: 0, cacheKey: "default", checkpointPath: null, fingerprint: "", memoryTask: null, overflowRecovery: { attempts: 0 } };
 
         if (isResponses && decoded.length) {
           const parsed = JSON.parse(decoded.toString("utf8"));
@@ -3229,6 +3462,7 @@ function createServer() {
           const kind = requestMeta.isCompaction ? "COMPACTION" : "response";
           if (CACHE_PROMPT) prepared.body.cache_prompt = true;
           if (LLAMA_SLOT >= 0) prepared.body.id_slot = LLAMA_SLOT;
+          requestMeta.requestChars = estimateRequestChars(prepared.body);
           diag(`${kind} request bytes=${decoded.length} input before=[${beforeTypes.join(",")}] after=[${afterTypes.join(",")}]`);
 
           outbound = Buffer.from(JSON.stringify(prepared.body));
@@ -3600,6 +3834,11 @@ function createServer() {
                 } else {
                   const kind = requestMeta.isCompaction ? "COMPACTION completed" : "response completed";
                   const usage = usageFrom(obj);
+                  const rawInTok = finiteInt(usage?.input_tokens ?? usage?.prompt_tokens);
+                  if (rawInTok && requestMeta.requestChars) {
+                    calibrateTokensFromActual(requestMeta.requestChars, rawInTok);
+                  }
+                  scaleUsageForCodex(usage);
                   let responseText = responseTextFromObject(obj);
                   diag(`${kind}; ${usageLine(usage)}`);
                   if (requestMeta.isCompaction && requestMeta.checkpointPath) {
@@ -3626,28 +3865,50 @@ function createServer() {
               diag(`${kind} status=${ures.statusCode || 0} body=${raw.toString("utf8").slice(0, 4000)}`);
             }
 
-            if ((ures.statusCode || 200) >= 400 && !responseCommitted && !attemptState.emergencyPruned && requestMeta.prepared?.body) {
+            if ((ures.statusCode || 200) >= 400 && !responseCommitted && requestMeta.prepared?.body) {
               const errBody = raw.toString("utf8");
               if (/exceed_context_size_error|exceeds the available context size/i.test(errBody)) {
-                attemptState.emergencyPruned = true;
-                const pBody = requestMeta.prepared.body;
-                let pruned = 0;
-                if (Array.isArray(pBody.input)) {
-                  for (let i = 0; i < pBody.input.length - 2; i++) {
-                    const it = pBody.input[i];
-                    if (!it || (it.type !== "function_call_output" && it.type !== "custom_tool_call_output")) continue;
-                    const s = typeof it.output === "string" ? it.output : JSON.stringify(it.output ?? "");
-                    if (s.length > 2000) {
-                      it.output = s.slice(0, 1500) + "\n...[EMERGENCY CONTEXT OVERFLOW TRUNCATED]...\n" + s.slice(-500);
-                      pruned++;
-                    }
+                let errPromptTokens = 0;
+                let errNCtx = 0;
+                try {
+                  const errJson = JSON.parse(errBody);
+                  errPromptTokens = Number(errJson?.error?.n_prompt_tokens || 0) || 0;
+                  errNCtx = Number(errJson?.error?.n_ctx || 0) || 0;
+                } catch {}
+                if (errNCtx > 0) MODEL_CONTEXT_STATE.nCtx = errNCtx;
+                if (errPromptTokens > 0 && requestMeta.requestChars > 0) {
+                  calibrateTokensFromActual(requestMeta.requestChars, errPromptTokens);
+                }
+                const recoveryState = requestMeta.overflowRecovery || (requestMeta.overflowRecovery = { attempts: 0 });
+                if (recoveryState.attempts < MAX_EMERGENCY_OVERFLOW_RETRIES) {
+                  recoveryState.attempts++;
+                  const pBody = requestMeta.prepared.body;
+                  const resPrune = emergencyPruneForOverflow(pBody, recoveryState.attempts, errPromptTokens, errNCtx || effectiveNCtx());
+                  if (resPrune.afterLen > 0 && resPrune.afterLen < resPrune.beforeLen) {
+                    requestMeta.requestChars = estimateRequestChars(pBody);
+                    diag(`EMERGENCY_OVERFLOW_RECOVERY round=${recoveryState.attempts}/${MAX_EMERGENCY_OVERFLOW_RETRIES} pruned=${resPrune.pruned} removed=${resPrune.removed} dropped_chars=${resPrune.beforeLen - resPrune.afterLen} actual_tokens=${errPromptTokens} n_ctx=${errNCtx || effectiveNCtx()}`);
+                    outbound = Buffer.from(JSON.stringify(pBody));
+                    headers["content-length"] = String(outbound.length);
+                    startUpstreamAttempt(attempt + 1);
+                    return;
                   }
                 }
-                if (pruned > 0) {
-                  diag(`EMERGENCY_OVERFLOW_RECOVERY pruned=${pruned} retrying attempt=${attempt + 1}`);
-                  outbound = Buffer.from(JSON.stringify(pBody));
-                  headers["content-length"] = String(outbound.length);
-                  startUpstreamAttempt(attempt + 1);
+                const wantsSse = String(req.headers.accept || "").includes("text/event-stream") || /"stream"\s*:\s*true/i.test(outbound.toString("utf8", 0, 500));
+                if (wantsSse && !SELFTEST_MODE && !res.headersSent && !res.destroyed) {
+                  res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", "connection": "close" });
+                  const errId = `msg_ctx_${Date.now()}`;
+                  const respId = `resp_ctx_${Date.now()}`;
+                  const errMsg = `⚠️ [Контекст модели переполнен]: Запрос (${errPromptTokens || "?"} токенов) превышает окно контекста модели (${errNCtx || effectiveNCtx()} токенов) даже после аварийного сжатия. Запустите /compact или начните новую сессию.`;
+                  const sseEvents = [
+                    `data: ${JSON.stringify({ type: "response.created", response: { id: respId, status: "in_progress", output: [] } })}\n\n`,
+                    `data: ${JSON.stringify({ type: "response.output_item.added", output_index: 0, item: { id: errId, type: "message", status: "in_progress", role: "assistant", content: [] } })}\n\n`,
+                    `data: ${JSON.stringify({ type: "response.output_text.delta", item_id: errId, output_index: 0, content_index: 0, delta: errMsg })}\n\n`,
+                    `data: ${JSON.stringify({ type: "response.output_item.done", output_index: 0, item: { id: errId, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text: errMsg, annotations: [] }] } })}\n\n`,
+                    `data: ${JSON.stringify({ type: "response.completed", response: { id: respId, status: "completed", output: [{ id: errId, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text: errMsg, annotations: [] }] }], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } })}\n\n`,
+                    `data: [DONE]\n\n`
+                  ];
+                  for (const e of sseEvents) res.write(e);
+                  res.end();
                   return;
                 }
               }
@@ -4831,6 +5092,45 @@ function selftest() {
     const foldedGitDiff = foldLargeBase64Text(gitDiffB64);
     if (!foldedGitDiff.includes("BASE64_BLOB_OMITTED") || foldedGitDiff.length > 500) {
       throw new Error("foldLargeBase64Text failed to collapse git diff base64");
+    }
+
+    const prevState = { ...MODEL_CONTEXT_STATE };
+    try {
+      MODEL_CONTEXT_STATE.nCtx = 32768;
+      MODEL_CONTEXT_STATE.charsPerToken = 2.8;
+      MODEL_CONTEXT_STATE.sampleCount = 0;
+      calibrateTokensFromActual(20000, 10000);
+      if (Math.abs(MODEL_CONTEXT_STATE.charsPerToken - 2.0) > 0.01) {
+        throw new Error("calibrateTokensFromActual failed");
+      }
+      const scaledTestUsage = { input_tokens: 16384, output_tokens: 100, total_tokens: 16484 };
+      scaleUsageForCodex(scaledTestUsage);
+      if (scaledTestUsage.input_tokens < 55000) {
+        throw new Error("scaleUsageForCodex failed for smaller nCtx");
+      }
+      const overflowBody = {
+        input: [
+          { type: "message", role: "user", content: "start" },
+          { type: "function_call_output", call_id: "c1", output: "x".repeat(3000) },
+          { type: "function_call_output", call_id: "c2", output: "y".repeat(3000) },
+          { type: "message", role: "user", content: "end1" },
+          { type: "message", role: "user", content: "end2" }
+        ]
+      };
+      const r1 = emergencyPruneForOverflow(overflowBody, 1, 130000, 120064);
+      if (r1.pruned !== 2 || r1.afterLen >= r1.beforeLen) {
+        throw new Error("emergencyPruneForOverflow round 1 failed");
+      }
+      const r1Repeat = emergencyPruneForOverflow(overflowBody, 1, 130000, 120064);
+      if (r1Repeat.pruned !== 0 || r1Repeat.afterLen !== r1Repeat.beforeLen) {
+        throw new Error("emergencyPruneForOverflow round 1 idempotency failed");
+      }
+      const r2 = emergencyPruneForOverflow(overflowBody, 2, 130000, 120064);
+      if (r2.pruned !== 2 || r2.afterLen >= r2.beforeLen) {
+        throw new Error("emergencyPruneForOverflow round 2 failed");
+      }
+    } finally {
+      Object.assign(MODEL_CONTEXT_STATE, prevState);
     }
   } finally {
     memoryStore.close();
