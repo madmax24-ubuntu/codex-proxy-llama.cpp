@@ -228,7 +228,7 @@ function emergencyPruneForOverflow(body, round, actualPromptTokens = 0, nCtx = 0
       if (!it || (it.type !== "function_call_output" && it.type !== "custom_tool_call_output")) continue;
       const s = typeof it.output === "string" ? it.output : JSON.stringify(it.output ?? "");
       if (s.length > 800) {
-        it.output = s.slice(0, 450) + "\n...[EMERGENCY OVERFLOW TRUNCATED]...\n" + s.slice(-200);
+        it.output = safeSlice(s, 0, 450) + "\n...[EMERGENCY OVERFLOW TRUNCATED]...\n" + safeSlice(s, -200);
         pruned++;
       }
     }
@@ -239,7 +239,7 @@ function emergencyPruneForOverflow(body, round, actualPromptTokens = 0, nCtx = 0
       if (it.type === "function_call_output" || it.type === "custom_tool_call_output") {
         const s = typeof it.output === "string" ? it.output : JSON.stringify(it.output ?? "");
         if (s.length > 300) {
-          it.output = s.slice(0, 150) + "\n...[TRUNCATED]...\n" + s.slice(-80);
+          it.output = safeSlice(s, 0, 150) + "\n...[TRUNCATED]...\n" + safeSlice(s, -80);
           pruned++;
         }
       }
@@ -306,6 +306,42 @@ function debug(...a) { if (DEBUG) console.log("[codex-llama-proxy:debug]", ...a)
 function diag(line) { if (SELFTEST_MODE) return; try { fs.appendFileSync(DIAG_PATH, `[${new Date().toISOString()}] ${line}\n`); } catch {} }
 function clone(x) { return JSON.parse(JSON.stringify(x)); }
 
+function safeSlice(str, start, end) {
+  if (typeof str !== "string") return str;
+  let s = typeof str.toWellFormed === "function" ? str.toWellFormed() : str;
+  const len = s.length;
+  let from = start === undefined ? 0 : (start < 0 ? Math.max(0, len + start) : Math.min(len, start));
+  let to = end === undefined ? len : (end < 0 ? Math.max(0, len + end) : Math.min(len, end));
+  if (from >= to) return "";
+  if (from > 0 && from < len) {
+    const code = s.charCodeAt(from);
+    if (code >= 0xdc00 && code <= 0xdfff) {
+      const prev = s.charCodeAt(from - 1);
+      if (prev >= 0xd800 && prev <= 0xdbff) from++;
+    }
+  }
+  if (to > 0 && to < len) {
+    const prev = s.charCodeAt(to - 1);
+    if (prev >= 0xd800 && prev <= 0xdbff) {
+      const next = s.charCodeAt(to);
+      if (next >= 0xdc00 && next <= 0xdfff) to--;
+    }
+  }
+  const res = s.slice(from, to);
+  return typeof res.toWellFormed === "function" ? res.toWellFormed() : res;
+}
+
+function sanitizeSurrogates(val) {
+  if (typeof val === "string") return typeof val.toWellFormed === "function" ? val.toWellFormed() : val;
+  if (!val || typeof val !== "object") return val;
+  if (Array.isArray(val)) {
+    for (let i = 0; i < val.length; i++) val[i] = sanitizeSurrogates(val[i]);
+    return val;
+  }
+  for (const k of Object.keys(val)) val[k] = sanitizeSurrogates(val[k]);
+  return val;
+}
+
 function safeMkdir(dir) {
   try { fs.mkdirSync(dir, { recursive: true }); return true; }
   catch { return false; }
@@ -317,14 +353,13 @@ const MEMORY_STOP_WORDS = new Set([
 ]);
 
 function memorySanitize(value, limit = 1600) {
-  return String(value || "")
+  return safeSlice(String(value || "")
     .replace(/-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----/gi, "[REDACTED PRIVATE KEY]")
     .replace(/\b(?:ghp_|github_pat_|sk-|xox[baprs]-)[A-Za-z0-9_.-]{12,}\b/g, "[REDACTED TOKEN]")
     .replace(/\b(authorization|api[_-]?key|access[_-]?token|password|passwd|secret)\s*[:=]\s*([^\s,;]+)/gi, "$1=[REDACTED]")
     .replace(/(https?:\/\/)([^\s:@/]+):([^\s@/]+)@/gi, "$1$2:[REDACTED]@")
     .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, limit);
+    .trim(), 0, limit);
 }
 
 function memoryTokens(value) {
@@ -646,11 +681,11 @@ function pruneCompactionInputHistory(body, maxCharsPerToolOutput = 3000) {
     if (item.type === "function_call_output" && Array.isArray(item.output)) {
       for (const block of item.output) {
         if (block && typeof block === "object" && typeof block.text === "string" && block.text.length > maxCharsPerToolOutput) {
-          block.text = block.text.slice(0, maxCharsPerToolOutput) + "\n...[truncated for compaction]...";
+          block.text = safeSlice(block.text, 0, maxCharsPerToolOutput) + "\n...[truncated for compaction]...";
         }
       }
     } else if (item.type === "function_call_output" && typeof item.output === "string" && item.output.length > maxCharsPerToolOutput) {
-      item.output = item.output.slice(0, maxCharsPerToolOutput) + "\n...[truncated for compaction]...";
+      item.output = safeSlice(item.output, 0, maxCharsPerToolOutput) + "\n...[truncated for compaction]...";
     }
   }
 }
@@ -1945,8 +1980,8 @@ function prunePostCompactionToolOutputs(body, maxChars = POST_COMPACT_TOOL_OUTPU
         const marker = `\n...[RECENT TOOL OUTPUT OVERSIZED TRUNCATED sha256=${digest} original_chars=${item.output.length}]...\n`;
         const available = Math.max(0, maxRecentChars - marker.length);
         const head = Math.floor(available * 0.75);
-        const tail = available - head > 0 ? item.output.slice(-(available - head)) : "";
-        item.output = item.output.slice(0, head) + marker + tail;
+        const tail = available - head > 0 ? safeSlice(item.output, -(available - head)) : "";
+        item.output = safeSlice(item.output, 0, head) + marker + tail;
         truncated++;
       }
       afterChars += item.output.length;
@@ -1961,8 +1996,8 @@ function prunePostCompactionToolOutputs(body, maxChars = POST_COMPACT_TOOL_OUTPU
       const marker = `\n...[POST-COMPACTION ${entry.source ? "SOURCE" : "TOOL"} OUTPUT TRUNCATED sha256=${digest} original_chars=${entry.chars}; do not repeat the call solely because this payload was compacted]...\n`;
       const available = Math.max(0, Math.min(entryLimit, remaining) - marker.length);
       const head = Math.floor(available * 0.75);
-      const tail = available - head > 0 ? item.output.slice(-(available - head)) : "";
-      item.output = item.output.slice(0, head) + marker + tail;
+      const tail = available - head > 0 ? safeSlice(item.output, -(available - head)) : "";
+      item.output = safeSlice(item.output, 0, head) + marker + tail;
       truncated++;
     }
     retained[bucket] += item.output.length;
@@ -3462,6 +3497,7 @@ function createServer() {
           const kind = requestMeta.isCompaction ? "COMPACTION" : "response";
           if (CACHE_PROMPT) prepared.body.cache_prompt = true;
           if (LLAMA_SLOT >= 0) prepared.body.id_slot = LLAMA_SLOT;
+          sanitizeSurrogates(prepared.body);
           requestMeta.requestChars = estimateRequestChars(prepared.body);
           diag(`${kind} request bytes=${decoded.length} input before=[${beforeTypes.join(",")}] after=[${afterTypes.join(",")}]`);
 
@@ -3664,6 +3700,7 @@ function createServer() {
                     }]
                   });
                 }
+                sanitizeSurrogates(followUpBody);
                 const followUpOutbound = Buffer.from(JSON.stringify(followUpBody));
                 const followUpHeaders = copyHeaders(req.headers);
                 followUpHeaders["content-length"] = String(followUpOutbound.length);
@@ -3712,6 +3749,7 @@ function createServer() {
                           ? "[SYSTEM: Another malformed tool fragment was discarded. The active task remains unfinished. Invoke the appropriate tool now and emit no text.]"
                           : "[SYSTEM: Still no tool call. Task is not done. Call a tool NOW. Do not write text.]" }] });
                       }
+                      sanitizeSurrogates(chainBody);
                       const chainOutbound = Buffer.from(JSON.stringify(chainBody));
                       const chainHeaders = copyHeaders(req.headers);
                       chainHeaders["content-length"] = String(chainOutbound.length);
@@ -3866,6 +3904,34 @@ function createServer() {
             }
 
             if ((ures.statusCode || 200) >= 400 && !responseCommitted && requestMeta.prepared?.body) {
+              if (requestMeta.isCompaction) {
+                const recoveryText = requestMeta.recoverySummary || buildCompactionRecoverySummary(requestMeta.prepared.body);
+                const respId = `resp_compaction_fallback_${Date.now()}`;
+                const fallbackObj = {
+                  id: respId,
+                  status: "completed",
+                  output: [{
+                    id: `msg_compaction_fallback_${Date.now()}`,
+                    type: "message",
+                    role: "assistant",
+                    status: "completed",
+                    content: [{ type: "output_text", text: recoveryText, annotations: [] }]
+                  }],
+                  usage: { input_tokens: 100, output_tokens: 200, total_tokens: 300 }
+                };
+                if (requestMeta.checkpointPath) {
+                  updateCheckpointSummary(requestMeta.checkpointPath, recoveryText, fallbackObj.usage);
+                }
+                const fallbackData = Buffer.from(JSON.stringify(fallbackObj));
+                res.writeHead(200, {
+                  "content-type": "application/json",
+                  "content-length": String(fallbackData.length),
+                  "connection": "close"
+                });
+                res.end(fallbackData);
+                diag(`COMPACTION fallback summary served after upstream error status=${ures.statusCode || 0}`);
+                return;
+              }
               const errBody = raw.toString("utf8");
               if (/exceed_context_size_error|exceeds the available context size/i.test(errBody)) {
                 let errPromptTokens = 0;
@@ -3887,6 +3953,7 @@ function createServer() {
                   if (resPrune.afterLen > 0 && resPrune.afterLen < resPrune.beforeLen) {
                     requestMeta.requestChars = estimateRequestChars(pBody);
                     diag(`EMERGENCY_OVERFLOW_RECOVERY round=${recoveryState.attempts}/${MAX_EMERGENCY_OVERFLOW_RETRIES} pruned=${resPrune.pruned} removed=${resPrune.removed} dropped_chars=${resPrune.beforeLen - resPrune.afterLen} actual_tokens=${errPromptTokens} n_ctx=${errNCtx || effectiveNCtx()}`);
+                    sanitizeSurrogates(pBody);
                     outbound = Buffer.from(JSON.stringify(pBody));
                     headers["content-length"] = String(outbound.length);
                     startUpstreamAttempt(attempt + 1);
@@ -5128,6 +5195,15 @@ function selftest() {
       const r2 = emergencyPruneForOverflow(overflowBody, 2, 130000, 120064);
       if (r2.pruned !== 2 || r2.afterLen >= r2.beforeLen) {
         throw new Error("emergencyPruneForOverflow round 2 failed");
+      }
+
+      if (safeSlice("abc📧def", 0, 4) !== "abc" || safeSlice("abc📧def", 0, 5) !== "abc📧") {
+        throw new Error("safeSlice surrogate pair preservation failed");
+      }
+      const surrogateObj = { text: "lone\ud83d\nsurrogate", list: ["valid", "broken\udce7"] };
+      sanitizeSurrogates(surrogateObj);
+      if (JSON.stringify(surrogateObj).includes("\\ud83d") || JSON.stringify(surrogateObj).includes("\\udce7")) {
+        throw new Error("sanitizeSurrogates failed to sanitize lone surrogates");
       }
     } finally {
       Object.assign(MODEL_CONTEXT_STATE, prevState);
